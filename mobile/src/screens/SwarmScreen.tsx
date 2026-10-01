@@ -10,6 +10,7 @@ import {
 } from 'react-native';
 import { socketService } from '../services/socketService';
 import type { SwarmRun, SwarmAgent, AgentPresetInfo } from '../types';
+import { HistoryView } from '../components/HistoryView';
 import * as Haptics from 'expo-haptics';
 
 export const SwarmScreen: React.FC = () => {
@@ -19,6 +20,7 @@ export const SwarmScreen: React.FC = () => {
   const [promptText, setPromptText] = useState('');
   const [presets, setPresets] = useState<AgentPresetInfo[]>(socketService.presets);
   const [presetId, setPresetId] = useState<string | undefined>(undefined);
+  const [segment, setSegment] = useState<'live' | 'history'>('live');
   const [replyAgent, setReplyAgent] = useState<SwarmAgent | null>(null);
   const [replyText, setReplyText] = useState('');
 
@@ -68,7 +70,24 @@ export const SwarmScreen: React.FC = () => {
         </TouchableOpacity>
       </View>
 
-      {/* Swarm Runs List */}
+      <View style={styles.segments}>
+        {(['live', 'history'] as const).map((seg) => (
+          <TouchableOpacity
+            key={seg}
+            style={[styles.segment, segment === seg && styles.segmentActive]}
+            onPress={() => setSegment(seg)}
+          >
+            <Text style={[styles.segmentText, segment === seg && styles.segmentTextActive]}>
+              {seg === 'live' ? `Live${runs.length ? ` (${runs.length})` : ''}` : 'History'}
+            </Text>
+          </TouchableOpacity>
+        ))}
+      </View>
+
+      {segment === 'history' ? (
+        <HistoryView onRerun={() => setSegment('live')} />
+      ) : (
+      /* Swarm Runs List */
       <ScrollView style={styles.runList} contentContainerStyle={styles.runListContent}>
         {runs.length === 0 ? (
           <View style={styles.emptyCard}>
@@ -164,6 +183,7 @@ export const SwarmScreen: React.FC = () => {
           })
         )}
       </ScrollView>
+      )}
 
       {/* Follow-up to a running agent */}
       <Modal visible={replyAgent !== null} transparent animationType="fade" onRequestClose={() => setReplyAgent(null)}>
@@ -253,6 +273,20 @@ function defaultPresetId(presets: AgentPresetInfo[]): string | undefined {
 }
 
 const styles = StyleSheet.create({
+  segments: {
+    flexDirection: 'row',
+    margin: 10,
+    marginBottom: 0,
+    backgroundColor: '#081422',
+    borderRadius: 8,
+    padding: 2,
+    borderWidth: 1,
+    borderColor: '#13283c',
+  },
+  segment: { flex: 1, alignItems: 'center', paddingVertical: 7, borderRadius: 6 },
+  segmentActive: { backgroundColor: '#00e5c8' },
+  segmentText: { color: '#9cb5cc', fontSize: 12, fontWeight: '600' },
+  segmentTextActive: { color: '#05111c', fontWeight: '800' },
   agentActions: {
     flexDirection: 'row',
     alignItems: 'center',

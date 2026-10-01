@@ -1,6 +1,19 @@
 import type { Workspace, Task, SwarmRun, SwarmAgent, AgentPresetInfo, ConnectionStatus } from '../types';
 import { getWebRTCBridge } from './bridgeRegistry';
 import { normalizePairingCode, normalizeSignalingUrl } from '../utils/pairing';
+import type { DirectoryCache, FileEntry } from '../utils/fileTree';
+import type { HistoryRun } from '../utils/history';
+import { bracketedPaste } from '../utils/review';
+
+export interface FilePreview {
+  path: string;
+  content: string;
+  loading: boolean;
+  error?: string;
+  truncated?: boolean;
+  binary?: boolean;
+  totalSize?: number;
+}
 
 type Listener = () => void;
 
@@ -42,6 +55,13 @@ export class SocketService {
   /** Bumped on every diff:data so screens can tell a fresh response from other updates. */
   public gitDiffVersion = 0;
   public lastCommandError: string | null = null;
+  /** Lazy file tree, keyed by project-relative directory ('' = root). */
+  public directories: DirectoryCache = {};
+  public projectRoot: string = '';
+  public filePreview: FilePreview | null = null;
+  public history: HistoryRun[] = [];
+  public historyLoading = false;
+  public historyError: string | null = null;
   public focusedPaneId: string | null = null;
   public paneOutputs: Map<string, string> = new Map();
   public paneDimensions: Map<string, { cols: number; rows: number }> = new Map();
@@ -418,7 +438,49 @@ export class SocketService {
 
   /** Type a follow-up message into a running agent's terminal. */
   public sendAgentFollowUp(agent: SwarmAgent, text: string) {
-    this.sendTerminalInput(agent.pane_id, text.endsWith('\r') ? text : `${text}\r`);
+    if (text.includes('\n')) {
+      this.sendPromptToPane(agent.pane_id, text);
+    } else {
+      this.sendTerminalInput(agent.pane_id, text.endsWith('\r') ? text : `${text}\r`);
+    }
+  }
+
+  /** Sends a (possibly multi-line) prompt to an agent terminal as a single pasted message. */
+  public sendPromptToPane(paneId: string, prompt: string) {
+    this.sendTerminalInput(paneId, bracketedPaste(prompt));
+  }
+
+  public requestDirectory(path: string, refresh = false) {
+    const existing = this.directories[path];
+    this.directories = { ...this.directories, [path]: { entries: existing?.entries ?? [], loading: true } };
+    this.send('files:list', { path, refresh });
+    this.notify();
+  }
+
+  public refreshFiles() {
+    // Drop everything below the root so expanded folders reload too.
+    const expanded = Object.keys(this.directories);
+    this.directories = {};
+    this.requestDirectory('', true);
+    expanded.filter((p) => p).forEach((p) => this.requestDirectory(p));
+  }
+
+  public readFile(path: string) {
+    this.filePreview = { path, content: '', loading: true };
+    this.send('files:read', { path });
+    this.notify();
+  }
+
+  public closeFilePreview() {
+    this.filePreview = null;
+    this.notify();
+  }
+
+  public requestHistory() {
+    this.historyLoading = true;
+    this.historyError = null;
+    this.send('history:request', {});
+    this.notify();
   }
 
   public killAgent(agentId: string) {
@@ -579,6 +641,48 @@ export class SocketService {
         this.gitDiff = typeof payload.diff === 'string' ? payload.diff : '';
         this.gitDiffError = typeof payload.error === 'string' ? payload.error : null;
         this.gitDiffVersion++;
+        this.notify();
+        break;
+      }
+
+      case 'files:listing': {
+        const path = typeof payload.path === 'string' ? payload.path : '';
+        if (typeof payload.root === 'string' && payload.root !== this.projectRoot) {
+          // Focused project changed on the desktop: the old tree no longer applies.
+          if (this.projectRoot) this.directories = {};
+          this.projectRoot = payload.root;
+        }
+        const entries: FileEntry[] = Array.isArray(payload.entries) ? payload.entries : [];
+        this.directories = {
+          ...this.directories,
+          [path]: { entries, loading: false, error: typeof payload.error === 'string' ? payload.error : undefined },
+        };
+        this.notify();
+        break;
+      }
+
+      case 'files:content': {
+        if (this.filePreview && this.filePreview.path === payload.path) {
+          this.filePreview = {
+            path: payload.path,
+            content: typeof payload.content === 'string' ? payload.content : '',
+            loading: false,
+            error: typeof payload.error === 'string' ? payload.error : undefined,
+            truncated: !!payload.truncated,
+            binary: !!payload.binary,
+            totalSize: typeof payload.totalSize === 'number' ? payload.totalSize : undefined,
+          };
+          this.notify();
+        }
+        break;
+      }
+
+      case 'history:data': {
+        this.history = Array.isArray(payload.runs)
+          ? payload.runs.map((r: any) => ({ ...r, agents: Array.isArray(r.agents) ? r.agents : [] }))
+          : [];
+        this.historyError = typeof payload.error === 'string' ? payload.error : null;
+        this.historyLoading = false;
         this.notify();
         break;
       }

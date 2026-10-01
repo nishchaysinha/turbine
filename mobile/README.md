@@ -13,7 +13,9 @@ Native mobile companion app for **Turbine** built with React Native and Expo. It
 - **Focus-to-Type Mode**: Tap any pane for a 1:1 xterm view at the desktop PTY size (fit width / fit screen / 1:1 / zoom). Type directly into the PTY, or switch to **compose mode** (✎) to write a full line and Send. The key bar has `Esc`, `Tab`, sticky `Ctrl` (applies to the next key from either keyboard), `^C`, `^D`, `^Z`, arrows and `y`/`n`.
 - **AI Swarm Orchestration**: Launch runs with a chosen agent preset, **reply** to a running agent or **stop** it, and get a banner / local notification when an agent finishes.
 - **Kanban Task Board**: Manage project tasks, update statuses, and trigger 1-tap "Run with Agent".
-- **Live Git Diffs**: Review code modifications made by AI agents on the go.
+- **Code review (Orca-style)**: Code → Changes shows per-file diffs with line numbers and next/previous-change navigation. Tap any line to leave a note; send all notes as one review prompt to a running agent (pasted as a single message), a new agent run, or the focused terminal. Notes survive reconnects and restarts.
+- **File explorer**: Code → Files browses the focused project lazily with git badges (M/U/A/D), and previews files with line numbers (tap a line to comment on it).
+- **Run history**: Swarm → History lists past runs for the project grouped by day, searchable across prompts and agent summaries, with one-tap **Re-run**.
 - **Troubleshooting**: a connection log on the connect screen and in the Control tab.
 
 ---

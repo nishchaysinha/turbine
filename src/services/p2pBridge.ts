@@ -19,6 +19,45 @@ const POLL_SLOW_MS = 8000;
 const POLL_FAST_WINDOW_MS = 3 * 60 * 1000;
 const REARM_DELAY_MS = 1000;
 const TERMINAL_BUFFER_BYTES = 256 * 1024;
+const FILE_TREE_TTL_MS = 15000;
+const FILE_PREVIEW_BYTES = 200 * 1024;
+const HISTORY_RUN_LIMIT = 50;
+
+interface FileTreeEntry {
+  path: string;
+  relativePath: string;
+  isDir: boolean;
+}
+
+interface FileContent {
+  content: string;
+  totalSize: number;
+  isComplete: boolean;
+}
+
+/**
+ * Normalizes a phone-supplied path relative to the project root. Rejects
+ * absolute paths and `..` so the phone can only browse inside the project.
+ */
+export function safeRelativePath(input: unknown): string | null {
+  if (input === undefined || input === null || input === '') return '';
+  if (typeof input !== 'string') return null;
+  const cleaned = input.replace(/\\/g, '/').replace(/^\.\/+/, '');
+  if (cleaned.startsWith('/') || /^[a-zA-Z]:/.test(cleaned)) return null;
+  const parts = cleaned.split('/').filter((p) => p && p !== '.');
+  if (parts.some((p) => p === '..')) return null;
+  return parts.join('/');
+}
+
+/** Folds `git status --porcelain` codes onto a directory listing (dirs get the "strongest" child status). */
+export function statusForEntry(rel: string, isDir: boolean, statuses: Record<string, string>): string | undefined {
+  if (!isDir) return statuses[rel]?.trim() || undefined;
+  const prefix = `${rel}/`;
+  for (const [path, code] of Object.entries(statuses)) {
+    if (path.startsWith(prefix)) return code.trim() === '??' ? '??' : 'M';
+  }
+  return undefined;
+}
 
 const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -95,6 +134,7 @@ export class P2PBridge {
   /** Incremented on every connect/disconnect so stale async work can bail out. */
   private generation = 0;
   private storeUnsubs: Array<() => void> = [];
+  private fileTreeCache = new Map<string, { at: number; entries: FileTreeEntry[]; statuses: Record<string, string> }>();
   private terminalBuffers = new Map<string, string>();
   private terminalDimensions = new Map<string, { cols: number; rows: number }>();
 
@@ -632,6 +672,21 @@ export class P2PBridge {
           break;
         }
 
+        case 'files:list': {
+          await this.sendDirectoryListing(payload.path, payload.refresh === true);
+          break;
+        }
+
+        case 'files:read': {
+          await this.sendFileContent(payload.path);
+          break;
+        }
+
+        case 'history:request': {
+          await this.sendRunHistory();
+          break;
+        }
+
         case 'swarm:kill_agent': {
           if (typeof payload.agentId === 'string') {
             await useSwarmStore.getState().killAgent(payload.agentId);
@@ -657,6 +712,104 @@ export class P2PBridge {
     } catch (e) {
       console.error('[P2PBridge] Failed to handle message:', msg.type, e);
       this.send('error', { type: msg.type, message: e instanceof Error ? e.message : String(e) });
+    }
+  }
+
+  private async loadFileTree(root: string, refresh: boolean) {
+    const cached = this.fileTreeCache.get(root);
+    if (cached && !refresh && Date.now() - cached.at < FILE_TREE_TTL_MS) return cached;
+    const entries = await invoke<FileTreeEntry[]>('list_workspace_files', { root });
+    let statuses: Record<string, string> = {};
+    try {
+      statuses = await invoke<Record<string, string>>('git_status', { path: root });
+    } catch {
+      // Not a git repo: no badges.
+    }
+    const fresh = { at: Date.now(), entries, statuses };
+    this.fileTreeCache.set(root, fresh);
+    return fresh;
+  }
+
+  /** One directory level at a time, like Orca's lazy explorer: cheap to send, cheap to render. */
+  private async sendDirectoryListing(requested: unknown, refresh: boolean) {
+    const root = this.resolveProjectPath();
+    const dir = safeRelativePath(requested);
+    if (dir === null) {
+      this.send('files:listing', { root, path: String(requested), entries: [], error: 'Path is outside the project' });
+      return;
+    }
+    try {
+      const tree = await this.loadFileTree(root, refresh);
+      const prefix = dir ? `${dir}/` : '';
+      const entries = tree.entries
+        .filter((e) => e.relativePath.startsWith(prefix) && !e.relativePath.slice(prefix.length).includes('/'))
+        .map((e) => ({
+          name: e.relativePath.slice(prefix.length),
+          path: e.relativePath,
+          isDir: e.isDir,
+          status: statusForEntry(e.relativePath, e.isDir, tree.statuses),
+        }))
+        .filter((e) => e.name);
+      this.send('files:listing', { root, path: dir, entries });
+    } catch (e) {
+      this.send('files:listing', { root, path: dir, entries: [], error: String(e) });
+    }
+  }
+
+  private async sendFileContent(requested: unknown) {
+    const root = this.resolveProjectPath();
+    const rel = safeRelativePath(requested);
+    if (!rel) {
+      this.send('files:content', { path: String(requested), content: '', error: 'Path is outside the project' });
+      return;
+    }
+    try {
+      const file = await invoke<FileContent>('read_file', {
+        path: `${root.replace(/\/+$/, '')}/${rel}`,
+        offset: 0,
+        limit: FILE_PREVIEW_BYTES,
+      });
+      const binary = file.content.slice(0, 4096).includes('\u0000');
+      this.send('files:content', {
+        path: rel,
+        content: binary ? '' : file.content,
+        binary,
+        truncated: !file.isComplete,
+        totalSize: file.totalSize,
+      });
+    } catch (e) {
+      this.send('files:content', { path: rel, content: '', error: String(e) });
+    }
+  }
+
+  /** Past swarm runs for the active project, newest first, each with its agents. */
+  private async sendRunHistory() {
+    const projectPath = this.resolveProjectPath();
+    try {
+      const runs = (await invoke<Array<Record<string, any>>>('load_swarm_runs', { projectPath })) ?? [];
+      const recent = [...runs]
+        .sort((a, b) => String(b.started_at ?? '').localeCompare(String(a.started_at ?? '')))
+        .slice(0, HISTORY_RUN_LIMIT);
+      // The DB copy of a run lags behind the store (status/agents are updated in
+      // memory as agents spawn and finish), so prefer live state when we have it.
+      const live = useSwarmStore.getState();
+      const withAgents = await Promise.all(
+        recent.map(async (run) => {
+          const liveRun = live.runs.find((r) => r.id === run.id);
+          let agents: unknown[] | undefined = live.agents.get(run.id);
+          if (!agents) {
+            try {
+              agents = (await invoke<unknown[]>('load_swarm_agents', { swarmRunId: run.id })) ?? [];
+            } catch {
+              agents = [];
+            }
+          }
+          return { ...run, ...(liveRun ?? {}), agents };
+        }),
+      );
+      this.send('history:data', { projectPath, runs: withAgents });
+    } catch (e) {
+      this.send('history:data', { projectPath, runs: [], error: String(e) });
     }
   }
 

@@ -4,7 +4,7 @@ import type { ActiveTab } from '../types';
 import { TerminalWorkspaceScreen } from '../screens/TerminalWorkspaceScreen';
 import { SwarmScreen } from '../screens/SwarmScreen';
 import { TasksScreen } from '../screens/TasksScreen';
-import { DiffsScreen } from '../screens/DiffsScreen';
+import { CodeScreen } from '../screens/CodeScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
 import { socketService } from '../services/socketService';
 import { onAgentFinished } from '../services/notifier';
@@ -18,7 +18,7 @@ const TABS: { id: ActiveTab; label: string; icon: string }[] = [
   { id: 'workspace', label: 'Workspace', icon: '📟' },
   { id: 'swarm', label: 'Swarm', icon: '🤖' },
   { id: 'tasks', label: 'Tasks', icon: '📋' },
-  { id: 'diffs', label: 'Diffs', icon: '📁' },
+  { id: 'code', label: 'Code', icon: '📁' },
   { id: 'settings', label: 'Control', icon: '⚙️' },
 ];
 
@@ -72,8 +72,8 @@ export const AppNavigator: React.FC<AppNavigatorProps> = ({ onDisconnect }) => {
         return <SwarmScreen />;
       case 'tasks':
         return <TasksScreen />;
-      case 'diffs':
-        return <DiffsScreen />;
+      case 'code':
+        return <CodeScreen />;
       case 'settings':
         return <SettingsScreen onDisconnect={onDisconnect} />;
       default:

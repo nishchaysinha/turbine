@@ -3,6 +3,7 @@ import { View, Text, TouchableOpacity, StyleSheet } from 'react-native';
 import type { LayoutNode, PaneConfig } from '../types';
 import { AnsiRenderer } from './AnsiRenderer';
 import { socketService } from '../services/socketService';
+import { toPreviewText } from '../utils/terminalText';
 
 interface TiledWorkspaceViewProps {
   layout: LayoutNode;
@@ -21,7 +22,7 @@ export const TiledWorkspaceView: React.FC<TiledWorkspaceViewProps> = ({
     if (node.type === 'leaf') {
       const pane = paneMap.get(node.paneId);
       const output = socketService.getPaneOutput(node.paneId);
-      const previewLines = output.split('\n').slice(-12).join('\n');
+      const previewLines = toPreviewText(output, 12);
 
       return (
         <TouchableOpacity

@@ -13,7 +13,8 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.turbine.companion",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSCameraUsageDescription": "Turbine Companion uses the camera to scan the pairing QR code shown on your desktop."
       }
     },
     "android": {
@@ -27,6 +28,19 @@
         "projectId": "21560b3a-b803-4614-8628-17f66309b0f2"
       }
     },
-    "owner": "owocorp"
+    "owner": "owocorp",
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Turbine Companion uses the camera to scan the pairing QR code shown on your desktop.",
+          "recordAudioAndroid": false
+        }
+      ],
+      [
+        "expo-notifications",
+        {}
+      ]
+    ]
   }
 }

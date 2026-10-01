@@ -159,7 +159,7 @@ export const TasksScreen: React.FC = () => {
       </ScrollView>
 
       {/* Create Task Modal */}
-      <Modal visible={newModalVisible} transparent animationType="slide">
+      <Modal visible={newModalVisible} transparent animationType="slide" onRequestClose={() => setNewModalVisible(false)}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
             <Text style={styles.modalTitle}>Create New Task</Text>

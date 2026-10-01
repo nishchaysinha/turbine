@@ -3,33 +3,19 @@ import { View, Text, TouchableOpacity, ScrollView, StyleSheet } from 'react-nati
 import * as Haptics from 'expo-haptics';
 
 interface VirtualKeyboardProps {
+  /** Receives raw key data; the parent applies a pending Ctrl modifier. */
   onKey: (data: string) => void;
+  /** Sticky Ctrl: applies to the next key typed here or on the phone keyboard. */
+  ctrlActive: boolean;
+  onToggleCtrl: () => void;
   onClear?: () => void;
 }
 
-export const VirtualKeyboard: React.FC<VirtualKeyboardProps> = ({ onKey, onClear }) => {
-  const [ctrlActive, setCtrlActive] = React.useState(false);
-
+export const VirtualKeyboard: React.FC<VirtualKeyboardProps> = ({ onKey, ctrlActive, onToggleCtrl, onClear }) => {
   const triggerKey = (data: string) => {
     try {
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     } catch {}
-
-    if (ctrlActive) {
-      setCtrlActive(false);
-      // Map common Ctrl combinations
-      const lower = data.toLowerCase();
-      if (lower === 'c') { onKey('\x03'); return; }
-      if (lower === 'd') { onKey('\x04'); return; }
-      if (lower === 'z') { onKey('\x1a'); return; }
-      if (lower === 'l') { onKey('\x0c'); return; }
-      if (lower === 'a') { onKey('\x01'); return; }
-      if (lower === 'e') { onKey('\x05'); return; }
-      if (lower === 'r') { onKey('\x12'); return; }
-      if (lower === 'w') { onKey('\x17'); return; }
-      if (lower === 'u') { onKey('\x15'); return; }
-      if (lower === 'k') { onKey('\x0b'); return; }
-    }
     onKey(data);
   };
 
@@ -48,7 +34,7 @@ export const VirtualKeyboard: React.FC<VirtualKeyboardProps> = ({ onKey, onClear
           style={[styles.keyBtn, ctrlActive && styles.ctrlKeyActive]}
           onPress={() => {
             try { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); } catch {}
-            setCtrlActive(!ctrlActive);
+            onToggleCtrl();
           }}
         >
           <Text style={[styles.keyText, ctrlActive && styles.ctrlTextActive]}>
@@ -100,11 +86,11 @@ export const VirtualKeyboard: React.FC<VirtualKeyboardProps> = ({ onKey, onClear
           <Text style={styles.keyText}>~</Text>
         </TouchableOpacity>
 
-        <TouchableOpacity style={[styles.keyBtn, styles.agentKey]} onPress={() => triggerKey('y\n')}>
+        <TouchableOpacity style={[styles.keyBtn, styles.agentKey]} onPress={() => triggerKey('y\r')}>
           <Text style={[styles.keyText, styles.agentText]}>y (Yes)</Text>
         </TouchableOpacity>
 
-        <TouchableOpacity style={[styles.keyBtn, styles.agentKey]} onPress={() => triggerKey('n\n')}>
+        <TouchableOpacity style={[styles.keyBtn, styles.agentKey]} onPress={() => triggerKey('n\r')}>
           <Text style={[styles.keyText, styles.agentText]}>n (No)</Text>
         </TouchableOpacity>
 

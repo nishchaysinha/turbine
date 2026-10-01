@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   View,
   Text,
@@ -8,38 +8,84 @@ import {
   StyleSheet,
   ActivityIndicator,
 } from 'react-native';
-import { socketService } from '../services/socketService';
+import { socketService, DEFAULT_SIGNALING_URL } from '../services/socketService';
+import { normalizePairingCode, normalizeSignalingUrl, parsePairingPayload } from '../utils/pairing';
+import { loadSavedHosts, rememberHost, forgetHost, type SavedHost } from '../services/savedHosts';
+import { QrScannerModal } from '../components/QrScannerModal';
+import { ConnectionLog } from '../components/ConnectionLog';
 import * as Haptics from 'expo-haptics';
 
-interface ConnectScreenProps {
-  onConnected: () => void;
+function timeAgo(ts: number): string {
+  const mins = Math.round((Date.now() - ts) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  return hours < 24 ? `${hours}h ago` : `${Math.round(hours / 24)}d ago`;
 }
 
-export const ConnectScreen: React.FC<ConnectScreenProps> = ({ onConnected }) => {
-  const [pairingCode, setPairingCode] = useState('');
-  const [signalingUrl, setSignalingUrl] = useState('https://signaling-taupe.vercel.app');
+export const ConnectScreen: React.FC = () => {
+  // Pre-fill from the previous session so reconnecting is one tap.
+  const [pairingCode, setPairingCode] = useState(socketService.pairingCode);
+  const [signalingUrl, setSignalingUrl] = useState(socketService.currentServerUrl || DEFAULT_SIGNALING_URL);
   const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(socketService.getErrorMessage());
+  const [hosts, setHosts] = useState<SavedHost[]>([]);
+  const [scanning, setScanning] = useState(false);
+  const [showLog, setShowLog] = useState(false);
 
-  const handleConnect = async () => {
-    if (!pairingCode.trim()) {
-      setError('Please enter the 6-character pairing code shown on your desktop screen.');
+  useEffect(() => {
+    let alive = true;
+    loadSavedHosts().then((saved) => {
+      if (!alive) return;
+      setHosts(saved);
+      // First launch after a restart: pre-fill the most recent desktop.
+      if (saved[0] && !socketService.pairingCode) {
+        setPairingCode(saved[0].pairingCode);
+        setSignalingUrl(saved[0].signalingUrl);
+      }
+    });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  const handleCodeChange = (text: string) => {
+    // Allow pasting the QR payload JSON as well as a bare code.
+    const payload = parsePairingPayload(text);
+    if (payload) {
+      setPairingCode(payload.pairingCode);
+      if (payload.signalingUrl) setSignalingUrl(payload.signalingUrl);
+      return;
+    }
+    setPairingCode(text.toUpperCase());
+  };
+
+  const handleConnect = async (override?: { pairingCode: string; signalingUrl?: string }) => {
+    const code = normalizePairingCode(override?.pairingCode ?? pairingCode);
+    const url = normalizeSignalingUrl(override?.signalingUrl ?? signalingUrl) || DEFAULT_SIGNALING_URL;
+    if (override?.signalingUrl) setSignalingUrl(url);
+    if (code.length < 10) {
+      setError('Please enter the 6-character pairing code shown in Turbine (e.g. TRB-AB12CD).');
       return;
     }
 
+    setPairingCode(code);
     setLoading(true);
     setError(null);
 
     try {
-      await socketService.connectP2P({
-        signalingUrl: signalingUrl.trim(),
-        pairingCode: pairingCode.trim().toUpperCase(),
-      });
-
+      // Resolves only once the direct DataChannel is open; App then switches screens.
+      await socketService.connectP2P({ signalingUrl: url, pairingCode: code });
+      const existing = hosts.find((h) => h.pairingCode === code && h.signalingUrl === url);
+      rememberHost({
+        pairingCode: code,
+        signalingUrl: url,
+        label: existing?.label || 'Turbine Desktop',
+        lastConnectedAt: Date.now(),
+      }).catch(() => {});
       try {
         Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
       } catch {}
-      onConnected();
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'P2P Connection failed');
       try {
@@ -79,11 +125,15 @@ export const ConnectScreen: React.FC<ConnectScreenProps> = ({ onConnected }) => 
           <TextInput
             style={styles.codeInput}
             value={pairingCode}
-            onChangeText={(text) => setPairingCode(text.toUpperCase())}
-            placeholder="TRB-..."
+            onChangeText={handleCodeChange}
+            placeholder="TRB-XXXXXX"
             placeholderTextColor="#4a657e"
             autoCapitalize="characters"
-            maxLength={7}
+            autoCorrect={false}
+            autoComplete="off"
+            returnKeyType="go"
+            onSubmitEditing={() => handleConnect()}
+            editable={!loading}
           />
         </View>
 
@@ -93,10 +143,12 @@ export const ConnectScreen: React.FC<ConnectScreenProps> = ({ onConnected }) => 
             style={styles.urlInput}
             value={signalingUrl}
             onChangeText={setSignalingUrl}
-            placeholder="https://signaling-taupe.vercel.app"
+            placeholder={DEFAULT_SIGNALING_URL}
             placeholderTextColor="#4a657e"
             autoCapitalize="none"
             autoCorrect={false}
+            keyboardType="url"
+            editable={!loading}
           />
         </View>
 
@@ -108,23 +160,80 @@ export const ConnectScreen: React.FC<ConnectScreenProps> = ({ onConnected }) => 
 
         <TouchableOpacity
           style={[styles.button, loading && styles.buttonDisabled]}
-          onPress={handleConnect}
+          onPress={() => handleConnect()}
           disabled={loading}
+          accessibilityLabel="Connect"
         >
           {loading ? (
-            <ActivityIndicator color="#050c16" />
+            <View style={styles.loadingRow}>
+              <ActivityIndicator color="#050c16" />
+              <Text style={styles.buttonText}>Connecting…</Text>
+            </View>
           ) : (
-            <Text style={styles.buttonText}>Establish Direct P2P Pipe</Text>
+            <Text style={styles.buttonText}>Connect</Text>
           )}
         </TouchableOpacity>
+
+        <TouchableOpacity style={styles.secondaryButton} onPress={() => setScanning(true)} disabled={loading}>
+          <Text style={styles.secondaryButtonText}>📷 Scan pairing QR</Text>
+        </TouchableOpacity>
       </View>
+
+      {hosts.length > 0 && (
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Recent desktops</Text>
+          {hosts.map((h) => (
+            <View key={`${h.signalingUrl}-${h.pairingCode}`} style={styles.hostRow}>
+              <TouchableOpacity
+                style={styles.hostInfo}
+                disabled={loading}
+                onPress={() => {
+                  setPairingCode(h.pairingCode);
+                  handleConnect({ pairingCode: h.pairingCode, signalingUrl: h.signalingUrl });
+                }}
+              >
+                <Text style={styles.hostCode}>{h.pairingCode}</Text>
+                <Text style={styles.hostMeta} numberOfLines={1}>
+                  {h.label} · {timeAgo(h.lastConnectedAt)} · {h.signalingUrl.replace(/^https?:\/\//, '')}
+                </Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.hostForget}
+                onPress={() => forgetHost(h.pairingCode, h.signalingUrl).then(setHosts)}
+                accessibilityLabel={`Forget ${h.pairingCode}`}
+              >
+                <Text style={styles.hostForgetText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+          ))}
+        </View>
+      )}
+
+      <TouchableOpacity style={styles.logToggle} onPress={() => setShowLog((v) => !v)}>
+        <Text style={styles.logToggleText}>{showLog ? '▾' : '▸'} Connection log</Text>
+      </TouchableOpacity>
+      {showLog && (
+        <View style={[styles.infoCard, { marginBottom: 20 }]}>
+          <ConnectionLog />
+        </View>
+      )}
+
+      <QrScannerModal
+        visible={scanning}
+        onClose={() => setScanning(false)}
+        onScanned={(payload) => {
+          setScanning(false);
+          setPairingCode(payload.pairingCode);
+          handleConnect(payload);
+        }}
+      />
 
       {/* Info Card */}
       <View style={styles.infoCard}>
         <Text style={styles.infoTitle}>How it works:</Text>
-        <Text style={styles.infoStep}>1. In Turbine Desktop, click 📱 Mobile Companion.</Text>
-        <Text style={styles.infoStep}>2. Click Start Pairing to generate your 6-character code.</Text>
-        <Text style={styles.infoStep}>3. Enter the code above $\rightarrow$ enjoy direct P2P control!</Text>
+        <Text style={styles.infoStep}>1. In Turbine Desktop, click 📱 Companion in the status bar.</Text>
+        <Text style={styles.infoStep}>2. Click Start Pairing to get your pairing code.</Text>
+        <Text style={styles.infoStep}>3. Enter the code above and tap Connect. The code stays valid for 24h, so you can reconnect with it.</Text>
       </View>
     </ScrollView>
   );
@@ -259,6 +368,61 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     marginTop: 4,
+  },
+  loadingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  secondaryButton: {
+    borderRadius: 10,
+    paddingVertical: 12,
+    alignItems: 'center',
+    marginTop: 10,
+    borderWidth: 1,
+    borderColor: '#173757',
+  },
+  secondaryButtonText: {
+    color: '#00e5c8',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  hostRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderTopWidth: 1,
+    borderTopColor: '#10263e',
+    paddingVertical: 10,
+  },
+  hostInfo: {
+    flex: 1,
+  },
+  hostCode: {
+    color: '#f0f6fc',
+    fontSize: 15,
+    fontWeight: '700',
+    letterSpacing: 1,
+  },
+  hostMeta: {
+    color: '#5c768d',
+    fontSize: 11,
+    marginTop: 2,
+  },
+  hostForget: {
+    padding: 8,
+  },
+  hostForgetText: {
+    color: '#5c768d',
+    fontSize: 14,
+  },
+  logToggle: {
+    paddingVertical: 8,
+    marginBottom: 8,
+  },
+  logToggleText: {
+    color: '#5c768d',
+    fontSize: 12,
+    fontWeight: '600',
   },
   buttonDisabled: {
     opacity: 0.6,

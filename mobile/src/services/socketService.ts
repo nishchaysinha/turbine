@@ -1,8 +1,30 @@
-import type { Workspace, Task, SwarmRun, SwarmAgent, ConnectionStatus } from '../types';
-import { getWebRTCBridge } from './WebRTCBridgeView';
+import type { Workspace, Task, SwarmRun, SwarmAgent, AgentPresetInfo, ConnectionStatus } from '../types';
+import { getWebRTCBridge } from './bridgeRegistry';
+import { normalizePairingCode, normalizeSignalingUrl } from '../utils/pairing';
 
 type Listener = () => void;
 
+export const DEFAULT_SIGNALING_URL = 'https://signaling-taupe.vercel.app';
+const CONNECT_TIMEOUT_MS = 20000;
+const RECONNECT_DELAYS_MS = [2000, 3000, 5000, 8000, 13000, 20000, 30000];
+/** The desktop re-arms its code a few seconds after a peer leaves; retry "busy" this many times. */
+const BUSY_RETRIES = 4;
+const BUSY_RETRY_DELAY_MS = 2000;
+const BUSY_PATTERN = /already connected/i;
+const MAX_PANE_BUFFER = 100000;
+const MAX_LOG_ENTRIES = 200;
+
+export interface ConnectionLogEntry {
+  at: number;
+  message: string;
+}
+
+/**
+ * Phone side of the Turbine link. Owns all mirrored desktop state and the
+ * connection lifecycle; the actual WebRTC work happens in the hidden
+ * WebView engine (WebRTCBridgeView) or, if available, a native
+ * RTCPeerConnection.
+ */
 export class SocketService {
   private pc: any | null = null;
   private dc: any | null = null;
@@ -14,20 +36,36 @@ export class SocketService {
   public tasks: Task[] = [];
   public swarmRuns: SwarmRun[] = [];
   public swarmAgents: SwarmAgent[] = [];
+  public presets: AgentPresetInfo[] = [];
   public gitDiff: string = '';
+  public gitDiffError: string | null = null;
+  /** Bumped on every diff:data so screens can tell a fresh response from other updates. */
+  public gitDiffVersion = 0;
+  public lastCommandError: string | null = null;
   public focusedPaneId: string | null = null;
   public paneOutputs: Map<string, string> = new Map();
   public paneDimensions: Map<string, { cols: number; rows: number }> = new Map();
-  public currentServerUrl: string = 'https://signaling-taupe.vercel.app';
+  public currentServerUrl: string = DEFAULT_SIGNALING_URL;
+  public pairingCode: string = '';
   public connectionMode: 'p2p' = 'p2p';
-  public region: string = 'P2P Direct (DTLS Encrypted)';
   public latencyMs: number | null = null;
+  /** True while we lost the desktop and are retrying with the same code. */
+  public reconnecting = false;
+
+  /** Recent connection events for the troubleshooting view (newest last). */
+  public connectionLog: ConnectionLogEntry[] = [];
 
   private listeners: Set<Listener> = new Set();
   private outputListeners: Set<(paneId: string, data: string) => void> = new Set();
   private resizeListeners: Set<(paneId: string, cols: number, rows: number) => void> = new Set();
   private syncListeners: Set<(paneId: string, cols: number, rows: number, buffer: string) => void> = new Set();
   private pingInterval: ReturnType<typeof setInterval> | null = null;
+  private connectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempt = 0;
+  private wantConnected = false;
+  private pendingConnect: { resolve: () => void; reject: (e: Error) => void; promise: Promise<void> } | null = null;
+  private busyRetriesLeft = 0;
 
   public subscribe(fn: Listener): () => void {
     this.listeners.add(fn);
@@ -50,7 +88,13 @@ export class SocketService {
   }
 
   public notify() {
-    this.listeners.forEach((fn) => fn());
+    this.listeners.forEach((fn) => {
+      try { fn(); } catch (e) { console.warn('[SocketService] listener failed:', e); }
+    });
+  }
+
+  public log(message: string) {
+    this.connectionLog = [...this.connectionLog, { at: Date.now(), message }].slice(-MAX_LOG_ENTRIES);
   }
 
   public getStatus(): ConnectionStatus {
@@ -61,64 +105,185 @@ export class SocketService {
     return this.errorMessage;
   }
 
+  /** Called by the transport (WebView engine or native DataChannel). */
   public setStatus(status: ConnectionStatus, latency?: number) {
-    this.status = status;
     if (latency !== undefined) {
       this.latencyMs = latency;
     }
+    const prev = this.status;
+    // The engine reports "disconnected" while it resets for a new attempt; keep
+    // showing "connecting" until the attempt actually succeeds or fails.
+    if (status === 'disconnected' && prev === 'connecting' && (this.pendingConnect || this.reconnecting)) {
+      this.notify();
+      return;
+    }
+    this.status = status;
+    if (status !== prev) this.log(`Status: ${prev} → ${status}`);
+
     if (status === 'connected') {
       this.errorMessage = null;
+      this.reconnecting = false;
+      this.reconnectAttempt = 0;
+      this.clearConnectTimer();
+      if (prev !== 'connected') {
+        this.pendingConnect?.resolve();
+        this.pendingConnect = null;
+        // Make sure we have the latest desktop state even if the initial sync raced us.
+        if (this.focusedPaneId) this.requestTerminalSync(this.focusedPaneId);
+      }
+    } else if (status === 'disconnected' || status === 'error') {
+      if (prev === 'connected' && this.wantConnected) {
+        this.scheduleReconnect();
+      } else if (this.pendingConnect && prev === 'connecting' && status === 'error') {
+        this.failPendingConnect(this.errorMessage || 'Connection failed');
+      }
     }
     this.notify();
   }
 
   public setErrorMessage(err: string) {
+    this.log(`Error: ${err}`);
     this.errorMessage = err;
-    this.status = 'error';
+    if (this.pendingConnect) {
+      this.failPendingConnect(err);
+    } else if (this.reconnecting) {
+      this.scheduleReconnect();
+    }
     this.notify();
   }
 
   /**
-   * Connect directly via WebRTC DataChannel.
-   * Prioritizes the iOS WebKit WebView bridge (works in Expo Go),
-   * and falls back to native RTCPeerConnection (in production native APK/IPA builds).
+   * Pair with the desktop. Resolves once the DataChannel is open; rejects on
+   * signaling errors or after a timeout.
    */
-  public async connectP2P({
-    signalingUrl,
-    pairingCode,
-  }: {
-    signalingUrl: string;
-    pairingCode: string;
-  }): Promise<void> {
+  public connectP2P({ signalingUrl, pairingCode }: { signalingUrl: string; pairingCode: string }): Promise<void> {
+    const code = normalizePairingCode(pairingCode);
+    const url = normalizeSignalingUrl(signalingUrl) || DEFAULT_SIGNALING_URL;
+    if (!code) return Promise.reject(new Error('Please enter the pairing code shown on your desktop.'));
+
     this.disconnect();
+    this.wantConnected = true;
+    this.currentServerUrl = url;
+    this.pairingCode = code;
+    this.busyRetriesLeft = BUSY_RETRIES;
+    return this.startAttempt();
+  }
+
+  private startAttempt(): Promise<void> {
+    this.log(`Connecting to ${this.pairingCode} via ${this.currentServerUrl}`);
     this.status = 'connecting';
     this.errorMessage = null;
-    this.currentServerUrl = signalingUrl.trim().replace(/\/+$/, '');
     this.notify();
+
+    // A retry within the same user-initiated connect keeps the original promise.
+    if (!this.pendingConnect) {
+      let resolve!: () => void;
+      let reject!: (e: Error) => void;
+      const promise = new Promise<void>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      this.pendingConnect = { resolve, reject, promise };
+    }
+    const promise = this.pendingConnect.promise;
+
+    this.clearConnectTimer();
+    this.connectTimer = setTimeout(() => {
+      this.connectTimer = null;
+      this.failPendingConnect(
+        'Timed out waiting for the desktop. Make sure Turbine is open with pairing started, then try again.'
+      );
+    }, CONNECT_TIMEOUT_MS);
 
     const bridge = getWebRTCBridge();
     if (bridge) {
-      // Use native WebKit WebRTC engine
-      bridge.connect(this.currentServerUrl, pairingCode.trim().toUpperCase());
+      bridge.connect(this.currentServerUrl, this.pairingCode);
+    } else {
+      this.connectNative().catch((e) => this.failPendingConnect(e instanceof Error ? e.message : String(e)));
+    }
+    return promise;
+  }
+
+  private failPendingConnect(message: string) {
+    this.clearConnectTimer();
+    this.teardownTransport();
+
+    // The code is still marked as answered by our previous session while the
+    // desktop re-arms it; give it a moment instead of failing right away.
+    if (!this.reconnecting && this.wantConnected && this.busyRetriesLeft > 0 && BUSY_PATTERN.test(message)) {
+      this.busyRetriesLeft--;
+      this.log(`Desktop busy, retrying in ${BUSY_RETRY_DELAY_MS / 1000}s`);
+      this.reconnectTimer = setTimeout(() => {
+        this.reconnectTimer = null;
+        if (this.wantConnected && this.pendingConnect) this.startAttempt();
+      }, BUSY_RETRY_DELAY_MS);
       return;
     }
 
-    // Fallback for native runtime with global RTCPeerConnection
-    const RTCPC = typeof RTCPeerConnection !== 'undefined' ? RTCPeerConnection : (globalThis as any).RTCPeerConnection;
-    if (!RTCPC) {
-      throw new Error('WebRTC bridge is initializing. Please tap Connect again.');
+    this.errorMessage = message;
+    const pending = this.pendingConnect;
+    this.pendingConnect = null;
+
+    if (this.reconnecting) {
+      pending?.reject(new Error(message));
+      this.scheduleReconnect();
+    } else {
+      this.status = 'error';
+      this.wantConnected = false;
+      pending?.reject(new Error(message));
+    }
+    this.notify();
+  }
+
+  private scheduleReconnect() {
+    if (!this.wantConnected) return;
+    if (this.reconnectTimer) return;
+    if (this.reconnectAttempt >= RECONNECT_DELAYS_MS.length) {
+      this.reconnecting = false;
+      this.wantConnected = false;
+      this.status = 'error';
+      this.errorMessage = 'Lost connection to the desktop. Reconnect with the pairing code shown in Turbine.';
+      this.log('Gave up reconnecting');
+      this.notify();
+      return;
+    }
+    this.teardownTransport();
+    this.reconnecting = true;
+    this.status = 'connecting';
+    const delay = RECONNECT_DELAYS_MS[this.reconnectAttempt++];
+    this.log(`Reconnect attempt ${this.reconnectAttempt} in ${delay / 1000}s`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.wantConnected) return;
+      this.startAttempt().catch(() => {});
+    }, delay);
+    this.notify();
+  }
+
+  private clearConnectTimer() {
+    if (this.connectTimer) {
+      clearTimeout(this.connectTimer);
+      this.connectTimer = null;
+    }
+  }
+
+  /** Native RTCPeerConnection path (dev clients with react-native-webrtc or similar). */
+  private async connectNative(): Promise<void> {
+    const g = globalThis as any;
+    const RTCPC = g.RTCPeerConnection;
+    const RTCSD = g.RTCSessionDescription;
+    if (!RTCPC || !RTCSD) {
+      throw new Error('WebRTC engine is still starting. Please tap Connect again.');
     }
 
-    const code = pairingCode.trim().toUpperCase();
-    const resp = await fetch(`${this.currentServerUrl}/api/pair/${code}`);
+    const code = this.pairingCode;
+    const resp = await fetch(`${this.currentServerUrl}/api/pair/${encodeURIComponent(code)}`);
     if (!resp.ok) {
-      throw new Error('Pairing code not found or expired on signaling server');
+      throw new Error(resp.status === 404 ? 'Pairing code not found or expired' : `Signaling error (${resp.status})`);
     }
-
     const data = await resp.json();
-    if (!data.offer) {
-      throw new Error('No SDP offer found for code: ' + code);
-    }
+    if (!data.offer) throw new Error('No offer found for code ' + code);
+    if (data.answer) throw new Error('This code is already connected to another device.');
 
     const pc = new RTCPC({
       iceServers: [
@@ -143,52 +308,38 @@ export class SocketService {
     pc.ondatachannel = (event: any) => {
       const dc = event.channel;
       this.dc = dc;
-
       dc.onopen = () => {
-        this.status = 'connected';
-        this.errorMessage = null;
         this.startPing();
-        this.notify();
+        this.setStatus('connected');
       };
-
-      dc.onmessage = (msgEvent: any) => {
-        this.handleMessage(msgEvent.data);
-      };
-
+      dc.onmessage = (msgEvent: any) => this.handleMessage(msgEvent.data);
       dc.onclose = () => {
-        this.status = 'disconnected';
         this.stopPing();
-        this.notify();
-      };
-
-      dc.onerror = () => {
-        this.status = 'error';
-        this.notify();
+        this.setStatus('disconnected');
       };
     };
 
-    await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
+    await pc.setRemoteDescription(new RTCSD(data.offer));
+    for (const cand of Array.isArray(data.offerCandidates) ? data.offerCandidates : []) {
+      try { await pc.addIceCandidate(cand); } catch {}
+    }
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
-
     await icePromise;
 
-    await fetch(`${this.currentServerUrl}/api/pair/${code}`, {
+    const post = await fetch(`${this.currentServerUrl}/api/pair/${encodeURIComponent(code)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        answer: pc.localDescription,
-        candidates: localCandidates,
-      }),
+      body: JSON.stringify({ answer: pc.localDescription, candidates: localCandidates }),
     });
+    if (!post.ok) {
+      throw new Error(post.status === 409 ? 'This code is already connected to another device.' : 'Failed to submit answer');
+    }
   }
 
-  public disconnect() {
+  private teardownTransport() {
     this.stopPing();
-    const bridge = getWebRTCBridge();
-    if (bridge) {
-      bridge.disconnect();
-    }
+    getWebRTCBridge()?.disconnect();
     if (this.dc) {
       try { this.dc.close(); } catch {}
       this.dc = null;
@@ -197,7 +348,26 @@ export class SocketService {
       try { this.pc.close(); } catch {}
       this.pc = null;
     }
+  }
+
+  /** User-initiated disconnect: stops any reconnect attempts. */
+  public disconnect() {
+    if (this.wantConnected) this.log('Disconnected by user');
+    this.wantConnected = false;
+    this.reconnecting = false;
+    this.reconnectAttempt = 0;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    this.clearConnectTimer();
+    if (this.pendingConnect) {
+      this.pendingConnect.reject(new Error('Disconnected'));
+      this.pendingConnect = null;
+    }
+    this.teardownTransport();
     this.status = 'disconnected';
+    this.latencyMs = null;
     this.notify();
   }
 
@@ -242,8 +412,17 @@ export class SocketService {
     this.notify();
   }
 
-  public triggerSwarm(prompt: string) {
-    this.send('swarm:start', { prompt });
+  public triggerSwarm(prompt: string, presetId?: string) {
+    this.send('swarm:start', { prompt, presetId });
+  }
+
+  /** Type a follow-up message into a running agent's terminal. */
+  public sendAgentFollowUp(agent: SwarmAgent, text: string) {
+    this.sendTerminalInput(agent.pane_id, text.endsWith('\r') ? text : `${text}\r`);
+  }
+
+  public killAgent(agentId: string) {
+    this.send('swarm:kill_agent', { agentId });
   }
 
   public updateTaskStatus(id: string, status: string) {
@@ -288,119 +467,127 @@ export class SocketService {
   // --- Message Ingestion ---
 
   public handleMessage(rawData: string) {
+    let msg: any;
     try {
-      const msg = JSON.parse(rawData);
-      switch (msg.type) {
-        case 'pong': {
-          const { clientTime } = msg.payload || {};
-          if (clientTime) {
-            this.latencyMs = Math.max(1, Date.now() - clientTime);
-          }
-          this.notify();
-          break;
-        }
-
-        case 'state:sync': {
-          const { workspaces, activeWorkspaceId, tasks, swarmRuns, swarmAgents, activePaneId } =
-            msg.payload || {};
-          if (workspaces) this.workspaces = workspaces;
-          if (activeWorkspaceId) this.activeWorkspaceId = activeWorkspaceId;
-          if (tasks) this.tasks = tasks;
-          if (swarmRuns) this.swarmRuns = swarmRuns;
-          if (swarmAgents) this.swarmAgents = swarmAgents;
-          if (activePaneId && !this.focusedPaneId) this.focusedPaneId = activePaneId;
-          this.notify();
-          break;
-        }
-
-        case 'terminal:output': {
-          const { paneId, data } = msg.payload || {};
-          if (paneId && data) {
-            const current = this.paneOutputs.get(paneId) || '';
-            let updated: string;
-            if (data.includes('\x1b[2J') || data.includes('\x1b[3J') || data.includes('\x1bc')) {
-              const clearIdx = Math.max(
-                data.lastIndexOf('\x1b[2J'),
-                data.lastIndexOf('\x1b[3J'),
-                data.lastIndexOf('\x1bc')
-              );
-              updated = data.substring(clearIdx);
-            } else {
-              updated = (current + data).slice(-100000);
-            }
-            this.paneOutputs.set(paneId, updated);
-            this.outputListeners.forEach((fn) => {
-              try { fn(paneId, data); } catch {}
-            });
-            this.notify();
-          }
-          break;
-        }
-
-        case 'terminal:resize': {
-          const { paneId, cols, rows } = msg.payload || {};
-          if (paneId && cols && rows) {
-            this.paneDimensions.set(paneId, { cols, rows });
-            this.resizeListeners.forEach((fn) => {
-              try { fn(paneId, cols, rows); } catch {}
-            });
-            this.notify();
-          }
-          break;
-        }
-
-        case 'terminal:sync': {
-          const { paneId, cols, rows, buffer } = msg.payload || {};
-          if (paneId) {
-            if (cols && rows) {
-              this.paneDimensions.set(paneId, { cols, rows });
-            }
-            if (typeof buffer === 'string') {
-              this.paneOutputs.set(paneId, buffer);
-            }
-            this.syncListeners.forEach((fn) => {
-              try { fn(paneId, cols || 80, rows || 24, buffer || ''); } catch {}
-            });
-            this.notify();
-          }
-          break;
-        }
-
-        case 'workspace:changed': {
-          const { activeWorkspaceId } = msg.payload || {};
-          if (activeWorkspaceId) {
-            this.activeWorkspaceId = activeWorkspaceId;
-            this.notify();
-          }
-          break;
-        }
-
-        case 'task:updated': {
-          const { tasks } = msg.payload || {};
-          if (tasks) {
-            this.tasks = tasks;
-            this.notify();
-          }
-          break;
-        }
-
-        case 'swarm:updated': {
-          const { runs, agents } = msg.payload || {};
-          if (runs) this.swarmRuns = runs;
-          if (agents) this.swarmAgents = agents;
-          this.notify();
-          break;
-        }
-
-        case 'diff:data': {
-          const { diff } = msg.payload || {};
-          this.gitDiff = diff || '';
-          this.notify();
-          break;
-        }
-      }
+      msg = JSON.parse(rawData);
     } catch (e) {
       console.warn('[SocketService] Parse error:', e);
+      return;
+    }
+    const payload = msg?.payload || {};
+
+    switch (msg?.type) {
+      case 'ping': {
+        // Desktop measures latency too; echo its timestamp back.
+        this.send('pong', { clientTime: payload.clientTime });
+        break;
+      }
+
+      case 'pong': {
+        if (payload.clientTime) {
+          this.latencyMs = Math.max(1, Date.now() - payload.clientTime);
+        }
+        this.notify();
+        break;
+      }
+
+      case 'state:sync': {
+        if (Array.isArray(payload.workspaces)) this.workspaces = payload.workspaces;
+        if (payload.activeWorkspaceId) this.activeWorkspaceId = payload.activeWorkspaceId;
+        if (Array.isArray(payload.tasks)) this.tasks = payload.tasks;
+        if (Array.isArray(payload.swarmRuns)) this.swarmRuns = payload.swarmRuns;
+        if (Array.isArray(payload.swarmAgents)) this.swarmAgents = payload.swarmAgents;
+        if (Array.isArray(payload.presets)) this.presets = payload.presets;
+        if (payload.activePaneId && !this.focusedPaneId) this.focusedPaneId = payload.activePaneId;
+        this.notify();
+        break;
+      }
+
+      case 'terminal:output': {
+        const { paneId, data } = payload;
+        if (paneId && typeof data === 'string' && data) {
+          const current = this.paneOutputs.get(paneId) || '';
+          let updated: string;
+          const clearIdx = Math.max(data.lastIndexOf('\x1b[2J'), data.lastIndexOf('\x1b[3J'), data.lastIndexOf('\x1bc'));
+          if (clearIdx >= 0) {
+            updated = data.substring(clearIdx);
+          } else {
+            updated = (current + data).slice(-MAX_PANE_BUFFER);
+          }
+          this.paneOutputs.set(paneId, updated);
+          this.outputListeners.forEach((fn) => {
+            try { fn(paneId, data); } catch {}
+          });
+          this.notify();
+        }
+        break;
+      }
+
+      case 'terminal:resize': {
+        const { paneId, cols, rows } = payload;
+        if (paneId && cols && rows) {
+          this.paneDimensions.set(paneId, { cols, rows });
+          this.resizeListeners.forEach((fn) => {
+            try { fn(paneId, cols, rows); } catch {}
+          });
+          this.notify();
+        }
+        break;
+      }
+
+      case 'terminal:sync': {
+        const { paneId, cols, rows, buffer } = payload;
+        if (paneId) {
+          if (cols && rows) {
+            this.paneDimensions.set(paneId, { cols, rows });
+          }
+          if (typeof buffer === 'string') {
+            this.paneOutputs.set(paneId, buffer.slice(-MAX_PANE_BUFFER));
+          }
+          this.syncListeners.forEach((fn) => {
+            try { fn(paneId, cols || 80, rows || 24, buffer || ''); } catch {}
+          });
+          this.notify();
+        }
+        break;
+      }
+
+      case 'workspace:changed': {
+        if (payload.activeWorkspaceId) {
+          this.activeWorkspaceId = payload.activeWorkspaceId;
+          this.notify();
+        }
+        break;
+      }
+
+      case 'task:updated': {
+        if (Array.isArray(payload.tasks)) {
+          this.tasks = payload.tasks;
+          this.notify();
+        }
+        break;
+      }
+
+      case 'swarm:updated': {
+        if (Array.isArray(payload.runs)) this.swarmRuns = payload.runs;
+        if (Array.isArray(payload.agents)) this.swarmAgents = payload.agents;
+        this.notify();
+        break;
+      }
+
+      case 'diff:data': {
+        this.gitDiff = typeof payload.diff === 'string' ? payload.diff : '';
+        this.gitDiffError = typeof payload.error === 'string' ? payload.error : null;
+        this.gitDiffVersion++;
+        this.notify();
+        break;
+      }
+
+      case 'error': {
+        this.lastCommandError = typeof payload.message === 'string' ? payload.message : 'Desktop command failed';
+        this.notify();
+        break;
+      }
     }
   }
 }

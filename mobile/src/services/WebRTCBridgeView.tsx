@@ -1,12 +1,10 @@
-import React, { useRef, useEffect } from 'react';
+import React, { useRef, useEffect, useCallback } from 'react';
 import { View, StyleSheet } from 'react-native';
-import { WebView } from 'react-native-webview';
+import { WebView, type WebViewMessageEvent } from 'react-native-webview';
+import { setWebRTCBridge } from './bridgeRegistry';
 
-export interface WebRTCBridgeRef {
-  connect: (signalingUrl: string, pairingCode: string) => void;
-  send: (message: string) => void;
-  disconnect: () => void;
-}
+export type { WebRTCBridgeRef } from './bridgeRegistry';
+export { getWebRTCBridge } from './bridgeRegistry';
 
 interface WebRTCBridgeViewProps {
   onStatusChange: (status: 'disconnected' | 'connecting' | 'connected', latency?: number) => void;
@@ -14,19 +12,16 @@ interface WebRTCBridgeViewProps {
   onError: (error: string) => void;
 }
 
-// Global ref accessible by services
-let globalBridgeRef: WebRTCBridgeRef | null = null;
-
-export function getWebRTCBridge(): WebRTCBridgeRef | null {
-  return globalBridgeRef;
-}
-
-const WEBRTC_HTML = `
+/**
+ * WebRTC engine page. Runs inside a hidden WebView so the DataChannel works
+ * in Expo Go (no native WebRTC module required).
+ */
+export const WEBRTC_HTML = `
 <!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Turbine WebRTC Native Engine</title>
+  <title>Turbine WebRTC Engine</title>
 </head>
 <body>
 <script>
@@ -34,116 +29,140 @@ const WEBRTC_HTML = `
   let dc = null;
   let pingInterval = null;
   let lastPingTime = null;
+  let attempt = 0;
 
-  function postToApp(type, payload = {}) {
+  function postToApp(type, payload) {
     if (window.ReactNativeWebView) {
-      window.ReactNativeWebView.postMessage(JSON.stringify({ type, ...payload }));
+      window.ReactNativeWebView.postMessage(JSON.stringify(Object.assign({ type: type }, payload || {})));
     }
   }
 
-  window.connectP2P = async function(signalingUrl, pairingCode) {
+  async function readError(resp, fallback) {
     try {
-      window.disconnectP2P();
+      const body = await resp.json();
+      if (body && body.error) return body.error;
+    } catch (e) {}
+    return fallback;
+  }
+
+  window.connectP2P = async function(signalingUrl, pairingCode) {
+    window.disconnectP2P(true);
+    const myAttempt = ++attempt;
+    try {
       postToApp('status', { status: 'connecting' });
 
       const cleanUrl = signalingUrl.replace(/\\/+$/, '');
-      const code = pairingCode.toUpperCase().trim();
+      const code = encodeURIComponent(pairingCode.toUpperCase().trim());
 
-      // 1. Fetch Desktop's WebRTC Offer
+      // 1. Fetch the desktop's offer
       const resp = await fetch(cleanUrl + '/api/pair/' + code);
       if (!resp.ok) {
-        throw new Error('Pairing code not found or expired on signaling server');
+        throw new Error(resp.status === 404
+          ? 'Pairing code not found or expired. Check the code shown in Turbine.'
+          : await readError(resp, 'Signaling server error (' + resp.status + ')'));
       }
-
       const data = await resp.json();
-      if (!data.offer) {
-        throw new Error('No SDP offer found for pairing code: ' + code);
-      }
+      if (myAttempt !== attempt) return;
+      if (!data.offer) throw new Error('No offer found for this pairing code.');
+      if (data.answer) throw new Error('This code is already connected to another device. Generate a new code in Turbine.');
 
-      // 2. Initialize RTCPeerConnection with STUN servers
+      // 2. Peer connection
       pc = new RTCPeerConnection({
         iceServers: [
           { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' }
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+          { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+          { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
         ]
       });
+      const thisPc = pc;
 
       const localCandidates = [];
-      const iceDonePromise = new Promise((resolve) => {
-        pc.onicecandidate = (event) => {
+      const iceDone = new Promise(function(resolve) {
+        thisPc.onicecandidate = function(event) {
           if (event.candidate) {
             localCandidates.push(event.candidate.toJSON ? event.candidate.toJSON() : event.candidate);
           } else {
             resolve();
           }
         };
-        // 2-second timeout for gathering
         setTimeout(resolve, 2000);
       });
 
-      // 3. Listen for DataChannel created by Desktop
-      pc.ondatachannel = (event) => {
+      thisPc.onconnectionstatechange = function() {
+        if (thisPc !== pc) return;
+        if (thisPc.connectionState === 'failed') {
+          postToApp('error', { message: 'Peer-to-peer connection failed (network blocked?).' });
+          window.disconnectP2P();
+        }
+      };
+
+      // 3. DataChannel is created by the desktop
+      thisPc.ondatachannel = function(event) {
+        if (thisPc !== pc) return;
         dc = event.channel;
+        const thisDc = dc;
 
-        dc.onopen = () => {
+        thisDc.onopen = function() {
           postToApp('status', { status: 'connected' });
-
-          // Start sub-second ping latency measurement
           if (pingInterval) clearInterval(pingInterval);
-          pingInterval = setInterval(() => {
-            if (dc && dc.readyState === 'open') {
+          pingInterval = setInterval(function() {
+            if (thisDc.readyState === 'open') {
               lastPingTime = Date.now();
-              dc.send(JSON.stringify({ type: 'ping', timestamp: lastPingTime }));
+              thisDc.send(JSON.stringify({ type: 'ping', payload: { clientTime: lastPingTime }, timestamp: lastPingTime }));
             }
           }, 3000);
         };
 
-        dc.onclose = () => {
+        thisDc.onclose = function() {
+          if (thisDc !== dc) return;
           if (pingInterval) clearInterval(pingInterval);
           postToApp('status', { status: 'disconnected' });
         };
 
-        dc.onerror = (err) => {
-          postToApp('error', { message: err.message || 'WebRTC DataChannel error' });
+        thisDc.onerror = function(err) {
+          console.warn('DataChannel error', err && err.message);
         };
 
-        dc.onmessage = (msgEvent) => {
+        thisDc.onmessage = function(msgEvent) {
           try {
             const parsed = JSON.parse(msgEvent.data);
             if (parsed.type === 'pong' && lastPingTime) {
-              const latency = Math.max(1, Date.now() - lastPingTime);
-              postToApp('latency', { latency });
+              postToApp('latency', { latency: Math.max(1, Date.now() - lastPingTime) });
               return;
             }
-          } catch {}
+          } catch (e) {}
           postToApp('message', { data: msgEvent.data });
         };
       };
 
-      // 4. Set remote offer & generate answer
-      await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
+      // 4. Apply offer, create answer
+      await thisPc.setRemoteDescription(new RTCSessionDescription(data.offer));
+      const offerCandidates = Array.isArray(data.offerCandidates) ? data.offerCandidates : [];
+      for (let i = 0; i < offerCandidates.length; i++) {
+        try { await thisPc.addIceCandidate(offerCandidates[i]); } catch (e) {}
+      }
+      const answer = await thisPc.createAnswer();
+      await thisPc.setLocalDescription(answer);
+      await iceDone;
+      if (myAttempt !== attempt) return;
 
-      // Wait for candidates
-      await iceDonePromise;
-
-      // 5. Submit answer to Vercel Serverless Signaling
+      // 5. Submit answer
       const answerResp = await fetch(cleanUrl + '/api/pair/' + code, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          answer: pc.localDescription,
-          candidates: localCandidates
-        })
+        body: JSON.stringify({ answer: thisPc.localDescription, candidates: localCandidates })
       });
-
       if (!answerResp.ok) {
-        throw new Error('Failed to submit WebRTC answer to signaling service');
+        throw new Error(answerResp.status === 409
+          ? 'This code is already connected to another device. Generate a new code in Turbine.'
+          : await readError(answerResp, 'Failed to submit answer to signaling service'));
       }
     } catch (e) {
-      postToApp('error', { message: e.message || String(e) });
-      postToApp('status', { status: 'disconnected' });
+      if (myAttempt !== attempt) return;
+      postToApp('error', { message: (e && e.message) || String(e) });
+      window.disconnectP2P();
     }
   };
 
@@ -153,20 +172,18 @@ const WEBRTC_HTML = `
     }
   };
 
-  window.disconnectP2P = function() {
+  window.disconnectP2P = function(silent) {
     if (pingInterval) {
       clearInterval(pingInterval);
       pingInterval = null;
     }
-    if (dc) {
-      try { dc.close(); } catch {}
-      dc = null;
-    }
-    if (pc) {
-      try { pc.close(); } catch {}
-      pc = null;
-    }
-    postToApp('status', { status: 'disconnected' });
+    const oldDc = dc;
+    const oldPc = pc;
+    dc = null;
+    pc = null;
+    if (oldDc) { try { oldDc.close(); } catch (e) {} }
+    if (oldPc) { try { oldPc.close(); } catch (e) {} }
+    if (!silent) postToApp('status', { status: 'disconnected' });
   };
 
   postToApp('ready', {});
@@ -181,43 +198,75 @@ export const WebRTCBridgeView: React.FC<WebRTCBridgeViewProps> = ({
   onError,
 }) => {
   const webViewRef = useRef<WebView>(null);
+  const readyRef = useRef(false);
+  const queueRef = useRef<string[]>([]);
+  const propsRef = useRef({ onStatusChange, onMessage, onError });
+  propsRef.current = { onStatusChange, onMessage, onError };
 
-  useEffect(() => {
-    globalBridgeRef = {
-      connect: (signalingUrl: string, pairingCode: string) => {
-        const js = `window.connectP2P(${JSON.stringify(signalingUrl)}, ${JSON.stringify(pairingCode)}); true;`;
-        webViewRef.current?.injectJavaScript(js);
-      },
-      send: (message: string) => {
-        const js = `window.sendDataChannel(${JSON.stringify(message)}); true;`;
-        webViewRef.current?.injectJavaScript(js);
-      },
-      disconnect: () => {
-        const js = `window.disconnectP2P(); true;`;
-        webViewRef.current?.injectJavaScript(js);
-      },
-    };
-
-    return () => {
-      globalBridgeRef = null;
-    };
+  const run = useCallback((js: string) => {
+    if (readyRef.current && webViewRef.current) {
+      webViewRef.current.injectJavaScript(js);
+    } else {
+      queueRef.current.push(js);
+    }
   }, []);
 
-  const handleMessage = (event: any) => {
+  useEffect(() => {
+    setWebRTCBridge({
+      connect: (signalingUrl: string, pairingCode: string) => {
+        // A new connect supersedes anything still queued.
+        queueRef.current = [];
+        run(`window.connectP2P(${JSON.stringify(signalingUrl)}, ${JSON.stringify(pairingCode)}); true;`);
+      },
+      send: (message: string) => {
+        if (!readyRef.current) return;
+        webViewRef.current?.injectJavaScript(`window.sendDataChannel(${JSON.stringify(message)}); true;`);
+      },
+      disconnect: () => {
+        queueRef.current = [];
+        if (readyRef.current) webViewRef.current?.injectJavaScript(`window.disconnectP2P(); true;`);
+      },
+    });
+    return () => setWebRTCBridge(null);
+  }, [run]);
+
+  const handleMessage = (event: WebViewMessageEvent) => {
+    let data: any;
     try {
-      const data = JSON.parse(event.nativeEvent.data);
-      if (data.type === 'status') {
-        onStatusChange(data.status);
-      } else if (data.type === 'latency') {
-        onStatusChange('connected', data.latency);
-      } else if (data.type === 'message') {
-        onMessage(data.data);
-      } else if (data.type === 'error') {
-        onError(data.message);
-      }
+      data = JSON.parse(event.nativeEvent.data);
     } catch (err) {
       console.error('[WebRTCBridgeView] Message parse error:', err);
+      return;
     }
+    const { onStatusChange, onMessage, onError } = propsRef.current;
+    switch (data.type) {
+      case 'ready': {
+        readyRef.current = true;
+        const pending = queueRef.current;
+        queueRef.current = [];
+        pending.forEach((js) => webViewRef.current?.injectJavaScript(js));
+        break;
+      }
+      case 'status':
+        onStatusChange(data.status);
+        break;
+      case 'latency':
+        onStatusChange('connected', data.latency);
+        break;
+      case 'message':
+        onMessage(data.data);
+        break;
+      case 'error':
+        onError(data.message);
+        break;
+    }
+  };
+
+  const handleReset = () => {
+    // The WebContent process died (iOS memory pressure): any live pipe is gone.
+    readyRef.current = false;
+    propsRef.current.onStatusChange('disconnected');
+    webViewRef.current?.reload();
   };
 
   return (
@@ -225,8 +274,10 @@ export const WebRTCBridgeView: React.FC<WebRTCBridgeViewProps> = ({
       <WebView
         ref={webViewRef}
         originWhitelist={['*']}
-        source={{ html: WEBRTC_HTML }}
+        source={{ html: WEBRTC_HTML, baseUrl: 'https://localhost' }}
         onMessage={handleMessage}
+        onContentProcessDidTerminate={handleReset}
+        onRenderProcessGone={handleReset}
         javaScriptEnabled={true}
         domStorageEnabled={true}
         allowsInlineMediaPlayback={true}

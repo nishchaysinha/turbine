@@ -19,9 +19,13 @@ export function CompanionModal({ isOpen, onClose }: CompanionModalProps) {
   const [copied, setCopied] = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [latency, setLatency] = useState<number | null>(p2pBridge.getLatency());
 
   useEffect(() => {
-    const unsubP2pStatus = p2pBridge.onStatusChange(setP2pStatus);
+    const unsubP2pStatus = p2pBridge.onStatusChange((status) => {
+      setP2pStatus(status);
+      setLatency(p2pBridge.getLatency());
+    });
     const unsubP2pSession = p2pBridge.onSessionChange(setP2pSession);
     const unsubP2pPeers = p2pBridge.onPeersChange(setP2pPeers);
 
@@ -43,7 +47,6 @@ export function CompanionModal({ isOpen, onClose }: CompanionModalProps) {
       type: 'turbine-p2p',
       signalingUrl: p2pSession.relayUrl,
       pairingCode: p2pSession.pairingCode,
-      token: p2pSession.token,
     });
 
     QRCode.toDataURL(payload, {
@@ -58,11 +61,11 @@ export function CompanionModal({ isOpen, onClose }: CompanionModalProps) {
       .catch((err) => console.error('QR generation failed:', err));
   }, [p2pSession]);
 
-  const handleConnect = async () => {
+  const handleConnect = async (fresh = false) => {
     setIsConnecting(true);
     setErrorMsg(null);
     try {
-      await p2pBridge.connect(signalingUrl);
+      await p2pBridge.connect(signalingUrl, { fresh });
     } catch (err: unknown) {
       setErrorMsg(err instanceof Error ? err.message : 'Connection failed');
     } finally {
@@ -119,13 +122,23 @@ export function CompanionModal({ isOpen, onClose }: CompanionModalProps) {
               disabled={p2pStatus === 'connected' || isConnecting}
             />
             {p2pSession ? (
-              <button className="companion-btn-stop" onClick={handleDisconnect}>
-                Stop
-              </button>
+              <>
+                <button
+                  className="companion-btn-start"
+                  onClick={() => handleConnect(true)}
+                  disabled={isConnecting}
+                  title="Invalidate this code and generate a new one"
+                >
+                  New Code
+                </button>
+                <button className="companion-btn-stop" onClick={handleDisconnect}>
+                  Stop
+                </button>
+              </>
             ) : (
               <button
                 className="companion-btn-start"
-                onClick={handleConnect}
+                onClick={() => handleConnect()}
                 disabled={isConnecting}
               >
                 {isConnecting ? 'Starting...' : 'Start Pairing'}
@@ -133,7 +146,7 @@ export function CompanionModal({ isOpen, onClose }: CompanionModalProps) {
             )}
           </div>
           <p className="companion-hint">
-            🔒 Ephemeral zero-cost pairing. Only facilitates the 2-second SDP handshake.
+            🔒 The server only relays the WebRTC handshake. The code stays valid for 24h, so your phone can reconnect with it.
           </p>
         </div>
 
@@ -179,7 +192,7 @@ export function CompanionModal({ isOpen, onClose }: CompanionModalProps) {
             />
             <span className="companion-status-text">
               {p2pStatus === 'connected'
-                ? '🟢 P2P Direct (DTLS E2EE) • ⚡ <5ms'
+                ? `🟢 P2P Direct (DTLS E2EE)${latency !== null ? ` • ⚡ ${latency}ms` : ''}`
                 : p2pSession
                 ? '🟡 Waiting for Phone Connection...'
                 : isConnecting

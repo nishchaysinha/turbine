@@ -1,10 +1,9 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import { createPairingSession } from '../../lib/store.js';
+import { createPairingSession, SignalingError } from '../../lib/store.js';
+import { BadRequest, readJson, sendJson, setCors } from '../../lib/http.js';
 
 export default async function handler(req: IncomingMessage, res: ServerResponse) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  setCors(res, 'POST, OPTIONS');
 
   if (req.method === 'OPTIONS') {
     res.statusCode = 204;
@@ -13,42 +12,36 @@ export default async function handler(req: IncomingMessage, res: ServerResponse)
   }
 
   if (req.method !== 'POST') {
-    res.statusCode = 405;
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ error: 'Method not allowed' }));
+    sendJson(res, 405, { error: 'Method not allowed' });
     return;
   }
 
-  let body = '';
-  req.on('data', (chunk) => {
-    body += chunk;
-  });
-
-  req.on('end', async () => {
-    try {
-      const data = JSON.parse(body || '{}');
-      if (!data.offer) {
-        res.statusCode = 400;
-        res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({ error: 'WebRTC SDP offer is required' }));
-        return;
-      }
-
-      const session = await createPairingSession(data.offer, data.candidates || [], data.token);
-
-      res.statusCode = 200;
-      res.setHeader('Content-Type', 'application/json');
-      res.end(
-        JSON.stringify({
-          code: session.code,
-          token: session.token,
-          expiresAt: session.expiresAt,
-        })
-      );
-    } catch {
-      res.statusCode = 400;
-      res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ error: 'Invalid JSON payload' }));
+  try {
+    const data = await readJson(req);
+    if (!data.offer) {
+      sendJson(res, 400, { error: 'WebRTC SDP offer is required' });
+      return;
     }
-  });
+
+    const { session, token } = await createPairingSession(
+      data.offer,
+      Array.isArray(data.candidates) ? data.candidates : [],
+      typeof data.token === 'string' ? data.token : undefined,
+      typeof data.code === 'string' ? data.code : undefined
+    );
+
+    sendJson(res, 200, {
+      code: session.code,
+      token,
+      offerVersion: session.offerVersion,
+      expiresAt: session.expiresAt,
+    });
+  } catch (e) {
+    if (e instanceof BadRequest) sendJson(res, 400, { error: e.message });
+    else if (e instanceof SignalingError) sendJson(res, e.status, { error: e.message });
+    else {
+      console.error('[Signaling] create failed:', e);
+      sendJson(res, 500, { error: 'Internal error' });
+    }
+  }
 }

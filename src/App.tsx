@@ -181,8 +181,8 @@ function App() {
   }, [focusedPaneId]);
 
   useEffect(() => {
-    p2pBridge.syncFullState();
-  }, [workspaces, activeWorkspaceId]);
+    p2pBridge.syncState();
+  }, [workspaces, activeWorkspaceId, focusedPaneId]);
 
   const lastFocusedByWsRef = useRef<Record<string, string>>({});
   useEffect(() => {

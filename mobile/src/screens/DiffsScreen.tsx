@@ -1,19 +1,31 @@
-import React, { useState, useEffect } from 'react';
-import { View, Text, TouchableOpacity, ScrollView, StyleSheet } from 'react-native';
+import React, { useState, useEffect, useCallback } from 'react';
+import { View, Text, TouchableOpacity, FlatList, StyleSheet } from 'react-native';
 import { socketService } from '../services/socketService';
 import * as Haptics from 'expo-haptics';
 
+const MAX_LINES = 5000;
+
 export const DiffsScreen: React.FC = () => {
   const [diff, setDiff] = useState(socketService.gitDiff);
-  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [error, setError] = useState(socketService.gitDiffError);
+  const [isRefreshing, setIsRefreshing] = useState(true);
 
   useEffect(() => {
-    socketService.requestDiff('.');
+    let seenVersion = socketService.gitDiffVersion;
     const unsub = socketService.subscribe(() => {
+      // Only a new diff:data response ends the refresh (pings also notify).
+      if (socketService.gitDiffVersion === seenVersion) return;
+      seenVersion = socketService.gitDiffVersion;
       setDiff(socketService.gitDiff);
+      setError(socketService.gitDiffError);
       setIsRefreshing(false);
     });
-    return unsub;
+    socketService.requestDiff('.');
+    const timeout = setTimeout(() => setIsRefreshing(false), 15000);
+    return () => {
+      unsub();
+      clearTimeout(timeout);
+    };
   }, []);
 
   const handleRefresh = () => {
@@ -24,7 +36,48 @@ export const DiffsScreen: React.FC = () => {
     } catch {}
   };
 
-  const lines = (diff || '').split('\n');
+  const allLines = (diff || '').split('\n');
+  const truncated = allLines.length > MAX_LINES;
+  const lines = truncated ? allLines.slice(0, MAX_LINES) : allLines;
+
+  const renderLine = useCallback(({ item: line }: { item: string }) => {
+    const isAdd = line.startsWith('+') && !line.startsWith('+++');
+    const isDel = line.startsWith('-') && !line.startsWith('---');
+    const isHeader = line.startsWith('diff --git') || line.startsWith('index ');
+    const isChunk = line.startsWith('@@');
+
+    return (
+      <View style={[styles.diffLine, isAdd && styles.addLine, isDel && styles.delLine, isHeader && styles.headerLine]}>
+        <Text
+          style={[
+            styles.diffText,
+            isAdd && styles.addText,
+            isDel && styles.delText,
+            isChunk && styles.chunkText,
+            isHeader && styles.headerText,
+          ]}
+        >
+          {line || ' '}
+        </Text>
+      </View>
+    );
+  }, []);
+
+  const empty = error ? (
+    <View style={styles.emptyCard}>
+      <Text style={styles.emptyTitle}>Couldn't load diff</Text>
+      <Text style={styles.emptySub}>{error}</Text>
+    </View>
+  ) : isRefreshing ? (
+    <View style={styles.emptyCard}>
+      <Text style={styles.emptySub}>Loading changes from desktop…</Text>
+    </View>
+  ) : (
+    <View style={styles.emptyCard}>
+      <Text style={styles.emptyTitle}>Working Tree Clean</Text>
+      <Text style={styles.emptySub}>No uncommitted git changes in the active project.</Text>
+    </View>
+  );
 
   return (
     <View style={styles.container}>
@@ -32,53 +85,28 @@ export const DiffsScreen: React.FC = () => {
       <View style={styles.header}>
         <View>
           <Text style={styles.title}>Git Changes</Text>
-          <Text style={styles.subtitle}>Live diff of files modified by agents</Text>
+          <Text style={styles.subtitle}>Live diff of the focused project on desktop</Text>
         </View>
-        <TouchableOpacity style={styles.refreshBtn} onPress={handleRefresh}>
+        <TouchableOpacity style={styles.refreshBtn} onPress={handleRefresh} disabled={isRefreshing}>
           <Text style={styles.refreshText}>{isRefreshing ? 'Loading...' : '↻ Refresh'}</Text>
         </TouchableOpacity>
       </View>
 
-      {/* Diff Scrollable View */}
-      <ScrollView style={styles.diffView} contentContainerStyle={styles.diffContent}>
-        {!diff ? (
-          <View style={styles.emptyCard}>
-            <Text style={styles.emptyTitle}>Working Tree Clean</Text>
-            <Text style={styles.emptySub}>No uncommitted git changes found on desktop.</Text>
-          </View>
-        ) : (
-          lines.map((line, idx) => {
-            const isAdd = line.startsWith('+') && !line.startsWith('+++');
-            const isDel = line.startsWith('-') && !line.startsWith('---');
-            const isHeader = line.startsWith('diff --git') || line.startsWith('index ');
-            const isChunk = line.startsWith('@@');
-
-            return (
-              <View
-                key={idx}
-                style={[
-                  styles.diffLine,
-                  isAdd && styles.addLine,
-                  isDel && styles.delLine,
-                  isHeader && styles.headerLine,
-                ]}
-              >
-                <Text
-                  style={[
-                    styles.diffText,
-                    isAdd && styles.addText,
-                    isDel && styles.delText,
-                    isChunk && styles.chunkText,
-                    isHeader && styles.headerText,
-                  ]}
-                >
-                  {line || ' '}
-                </Text>
-              </View>
-            );
-          })
-        )}
-      </ScrollView>
+      <FlatList
+        style={styles.diffView}
+        contentContainerStyle={styles.diffContent}
+        data={diff ? lines : []}
+        keyExtractor={(_, idx) => String(idx)}
+        renderItem={renderLine}
+        ListEmptyComponent={empty}
+        ListFooterComponent={
+          truncated ? (
+            <Text style={styles.emptySub}>… {allLines.length - MAX_LINES} more lines (view on desktop)</Text>
+          ) : null
+        }
+        initialNumToRender={60}
+        windowSize={11}
+      />
     </View>
   );
 };

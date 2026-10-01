@@ -5,23 +5,20 @@ import { socketService } from './src/services/socketService';
 import { ConnectScreen } from './src/screens/ConnectScreen';
 import { AppNavigator } from './src/navigation/AppNavigator';
 import { WebRTCBridgeView } from './src/services/WebRTCBridgeView';
+import { startAgentNotifier } from './src/services/notifier';
+
+/** Stay on the main UI while connected or while silently reconnecting. */
+function isSessionActive(): boolean {
+  return socketService.getStatus() === 'connected' || socketService.reconnecting;
+}
 
 export default function App() {
-  const [isConnected, setIsConnected] = useState(
-    socketService.getStatus() === 'connected'
-  );
+  const [isConnected, setIsConnected] = useState(isSessionActive());
 
   useEffect(() => {
-    const unsub = socketService.subscribe(() => {
-      setIsConnected(socketService.getStatus() === 'connected');
-    });
-    return unsub;
+    startAgentNotifier();
+    return socketService.subscribe(() => setIsConnected(isSessionActive()));
   }, []);
-
-  const handleDisconnect = () => {
-    socketService.disconnect();
-    setIsConnected(false);
-  };
 
   return (
     <SafeAreaView style={styles.container}>
@@ -32,9 +29,9 @@ export default function App() {
         onError={(err) => socketService.setErrorMessage(err)}
       />
       {isConnected ? (
-        <AppNavigator onDisconnect={handleDisconnect} />
+        <AppNavigator onDisconnect={() => socketService.disconnect()} />
       ) : (
-        <ConnectScreen onConnected={() => setIsConnected(true)} />
+        <ConnectScreen />
       )}
     </SafeAreaView>
   );

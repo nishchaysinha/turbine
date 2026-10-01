@@ -7,15 +7,38 @@ import { FocusedTerminalView } from '../components/FocusedTerminalView';
 export const TerminalWorkspaceScreen: React.FC = () => {
   const [workspaces, setWorkspaces] = useState(socketService.workspaces);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState(socketService.activeWorkspaceId);
-  const [focusedPaneId, setFocusedPaneId] = useState<string | null>(null);
+  const [focusedPaneId, setFocusedPaneIdState] = useState<string | null>(null);
+  const [, setOutputTick] = useState(0);
 
   useEffect(() => {
     const unsub = socketService.subscribe(() => {
       setWorkspaces(socketService.workspaces);
       setActiveWorkspaceId(socketService.activeWorkspaceId);
     });
-    return unsub;
+    // Re-render the tiled previews when output arrives, at most ~3x/second.
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const bump = () => {
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = null;
+        setOutputTick((t) => t + 1);
+      }, 300);
+    };
+    const unsubOutput = socketService.onTerminalOutput(bump);
+    const unsubSync = socketService.onTerminalSync(bump);
+    return () => {
+      unsub();
+      unsubOutput();
+      unsubSync();
+      if (timer) clearTimeout(timer);
+    };
   }, []);
+
+  const setFocusedPaneId = (paneId: string | null) => {
+    setFocusedPaneIdState(paneId);
+    // Tell the desktop which pane we're driving (also scopes diffs/tasks to its project).
+    socketService.setFocusedPane(paneId);
+  };
 
   const activeWorkspace =
     workspaces.find((w) => w.id === activeWorkspaceId) || workspaces[0];

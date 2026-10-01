@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { View, Text, TouchableOpacity, ScrollView, StyleSheet } from 'react-native';
 import { socketService } from '../services/socketService';
 import type { Workspace } from '../types';
+import { ConnectionLog } from '../components/ConnectionLog';
 
 interface SettingsScreenProps {
   onDisconnect: () => void;
@@ -10,11 +11,15 @@ interface SettingsScreenProps {
 export const SettingsScreen: React.FC<SettingsScreenProps> = ({ onDisconnect }) => {
   const [workspaces, setWorkspaces] = useState<Workspace[]>(socketService.workspaces);
   const [activeWorkspaceId, setActiveWorkspaceId] = useState(socketService.activeWorkspaceId);
+  const [latencyMs, setLatencyMs] = useState(socketService.latencyMs);
+  const [status, setStatus] = useState(socketService.getStatus());
 
   useEffect(() => {
     const unsub = socketService.subscribe(() => {
       setWorkspaces(socketService.workspaces);
       setActiveWorkspaceId(socketService.activeWorkspaceId);
+      setLatencyMs(socketService.latencyMs);
+      setStatus(socketService.getStatus());
     });
     return unsub;
   }, []);
@@ -35,20 +40,26 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ onDisconnect }) 
         <Text style={styles.cardTitle}>Connection Info</Text>
         <View style={styles.infoRow}>
           <Text style={styles.infoLabel}>Status:</Text>
-          <View style={styles.statusPill}>
-            <View style={styles.statusDot} />
-            <Text style={styles.statusText}>Connected via Relay</Text>
+          <View style={[styles.statusPill, status !== 'connected' && styles.statusPillWarn]}>
+            <View style={[styles.statusDot, status !== 'connected' && styles.statusDotWarn]} />
+            <Text style={[styles.statusText, status !== 'connected' && styles.statusTextWarn]}>
+              {status === 'connected' ? 'Direct P2P (DTLS)' : 'Reconnecting…'}
+            </Text>
           </View>
         </View>
         <View style={styles.infoRow}>
-          <Text style={styles.infoLabel}>Region & Latency:</Text>
-          <Text style={styles.infoValue}>
-            ⚡ {socketService.latencyMs ? `${socketService.latencyMs}ms` : '<1ms'} ({socketService.region ? `Fly.io ${socketService.region}` : 'local'})
-          </Text>
+          <Text style={styles.infoLabel}>Latency:</Text>
+          <Text style={styles.infoValue}>{status !== 'connected' ? '—' : latencyMs !== null ? `⚡ ${latencyMs}ms` : 'measuring…'}</Text>
         </View>
         <View style={styles.infoRow}>
-          <Text style={styles.infoLabel}>Server:</Text>
-          <Text style={styles.infoValue}>{socketService.currentServerUrl || 'Relay Server'}</Text>
+          <Text style={styles.infoLabel}>Pairing code:</Text>
+          <Text style={styles.infoValue}>{socketService.pairingCode}</Text>
+        </View>
+        <View style={styles.infoRow}>
+          <Text style={styles.infoLabel}>Signaling:</Text>
+          <Text style={styles.infoValue} numberOfLines={1}>
+            {socketService.currentServerUrl.replace(/^https?:\/\//, '')}
+          </Text>
         </View>
       </View>
 
@@ -73,12 +84,18 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ onDisconnect }) 
                 <Text style={[styles.wsName, isActive && styles.wsNameActive]}>
                   {ws.name}
                 </Text>
-                <Text style={styles.wsPanes}>{ws.panes.length} panes</Text>
+                <Text style={styles.wsPanes}>{ws.panes.length} {ws.panes.length === 1 ? 'pane' : 'panes'}</Text>
               </View>
               {isActive && <Text style={styles.activeCheck}>✓ Active</Text>}
             </TouchableOpacity>
           );
         })}
+      </View>
+
+      {/* Troubleshooting */}
+      <View style={styles.card}>
+        <Text style={styles.cardTitle}>Connection log</Text>
+        <ConnectionLog limit={15} />
       </View>
 
       {/* Disconnect Button */}
@@ -135,6 +152,8 @@ const styles = StyleSheet.create({
     fontSize: 13,
   },
   infoValue: {
+    flexShrink: 1,
+    marginLeft: 12,
     color: '#c4d8ea',
     fontSize: 12,
     fontFamily: 'Courier',
@@ -147,6 +166,15 @@ const styles = StyleSheet.create({
     paddingHorizontal: 8,
     paddingVertical: 3,
     borderRadius: 12,
+  },
+  statusPillWarn: {
+    backgroundColor: 'rgba(255, 203, 107, 0.15)',
+  },
+  statusDotWarn: {
+    backgroundColor: '#ffcb6b',
+  },
+  statusTextWarn: {
+    color: '#ffcb6b',
   },
   statusDot: {
     width: 6,

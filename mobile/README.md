@@ -6,12 +6,15 @@ Native mobile companion app for **Turbine** built with React Native and Expo. It
 
 ## Features
 
+- **Direct P2P link**: a WebRTC DataChannel straight to Turbine Desktop. The signaling service only relays the handshake; codes look like `TRB-XXXXXX` and stay valid for 24h, so reconnecting is one tap.
+- **Pair by QR or code**: scan the QR in Turbine's Companion dialog, type the code (any case, with or without `TRB-`), or tap a **recent desktop**.
+- **Auto-reconnect**: if the link drops the app keeps its state, shows a banner and re-pairs with the same code.
 - **Desktop Layout Mirroring**: View your multi-pane terminal workspace on mobile with the exact spatial layout and proportions as your desktop monitor.
-- **Focus-to-Type Mode**: Tap any terminal pane to focus and maximize it for comfortable typing, with a mobile virtual keyboard (`Esc`, `Tab`, `Ctrl+C`, `↑`, `↓`, `y`, `n`) and prompt input bar. Tapping "← Tiled Layout" unfocuses and returns to the desktop overview.
-- **AI Swarm Orchestration**: Monitor autonomous agent runs (Builder, Reviewer, etc.) and launch new swarms remotely.
+- **Focus-to-Type Mode**: Tap any pane for a 1:1 xterm view at the desktop PTY size (fit width / fit screen / 1:1 / zoom). Type directly into the PTY, or switch to **compose mode** (✎) to write a full line and Send. The key bar has `Esc`, `Tab`, sticky `Ctrl` (applies to the next key from either keyboard), `^C`, `^D`, `^Z`, arrows and `y`/`n`.
+- **AI Swarm Orchestration**: Launch runs with a chosen agent preset, **reply** to a running agent or **stop** it, and get a banner / local notification when an agent finishes.
 - **Kanban Task Board**: Manage project tasks, update statuses, and trigger 1-tap "Run with Agent".
 - **Live Git Diffs**: Review code modifications made by AI agents on the go.
-- **Global Remote Access**: Connect via the dedicated cloud relay server or direct local socket.
+- **Troubleshooting**: a connection log on the connect screen and in the Control tab.
 
 ---
 
@@ -23,10 +26,28 @@ Native mobile companion app for **Turbine** built with React Native and Expo. It
 
 ### Start Dev Server
 ```bash
-cd mobile
-npm install
-npm start
+pnpm install
+pnpm start        # dev client / Expo Go
+pnpm web          # runs in a browser (WebView is shimmed with an iframe)
 ```
 
 1. Scan the Metro QR code shown in the terminal with the **Expo Go** app on your phone.
 2. When the Turbine Companion app opens on your phone, enter the 6-character pairing code displayed in Turbine Desktop (or scan the pairing QR code).
+
+---
+
+## Testing
+
+```bash
+pnpm typecheck
+pnpm test                 # unit tests (connection lifecycle, protocol, helpers)
+
+cd e2e && pnpm install
+pnpm test                 # full end-to-end run, see below
+```
+
+`e2e/run.mjs` pairs the real app (web build) with the real desktop `P2PBridge` from the
+`turbine` repo over a real WebRTC DataChannel, using the real `turbine-signaling` handlers
+(with an in-memory ntfy). It expects `turbine` and `turbine-signaling` checked out next to this
+repo (override with `TURBINE_DIR` / `SIGNALING_DIR`). Every step is screenshotted into
+[`e2e/screenshots`](e2e/screenshots/README.md), which doubles as a visual walkthrough of the app.

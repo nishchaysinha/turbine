@@ -5,11 +5,14 @@ import {
   TouchableOpacity,
   StyleSheet,
   KeyboardAvoidingView,
+  TextInput,
   Platform,
 } from 'react-native';
 import { WebView } from 'react-native-webview';
 import type { PaneConfig } from '../types';
 import { VirtualKeyboard } from './VirtualKeyboard';
+import { TERMINAL_HTML } from './terminalHtml';
+import { ctrlChord } from '../utils/keys';
 import { socketService } from '../services/socketService';
 import * as Haptics from 'expo-haptics';
 
@@ -32,6 +35,20 @@ export const FocusedTerminalView: React.FC<FocusedTerminalViewProps> = ({
   const [showPanePicker, setShowPanePicker] = useState(false);
   const [scaleMode, setScaleMode] = useState<ScaleMode>('fit-width');
   const [scalePercent, setScalePercent] = useState<number>(100);
+  const [ctrlActive, setCtrlActive] = useState(false);
+  // Orca-style input modes: type straight into the PTY, or compose a full line first.
+  const [composeMode, setComposeMode] = useState(false);
+  const [draft, setDraft] = useState('');
+  const historyRef = useRef<string[]>([]);
+  const ctrlRef = useRef(false);
+  ctrlRef.current = ctrlActive;
+  const scaleModeRef = useRef<ScaleMode>(scaleMode);
+  scaleModeRef.current = scaleMode;
+  const readyRef = useRef(false);
+
+  const inject = useCallback((js: string) => {
+    if (readyRef.current) webViewRef.current?.injectJavaScript(js);
+  }, []);
   const [dimensions, setDimensions] = useState(
     socketService.getPaneDimensions(pane.id) || { cols: 80, rows: 24 }
   );
@@ -49,24 +66,21 @@ export const FocusedTerminalView: React.FC<FocusedTerminalViewProps> = ({
   useEffect(() => {
     const unsubOutput = socketService.onTerminalOutput((paneId, data) => {
       if (paneId === pane.id) {
-        const script = `window.writeOutput && window.writeOutput(${JSON.stringify(data)}); true;`;
-        webViewRef.current?.injectJavaScript(script);
+        inject(`window.writeOutput && window.writeOutput(${JSON.stringify(data)}); true;`);
       }
     });
 
     const unsubResize = socketService.onTerminalResize((paneId, cols, rows) => {
       if (paneId === pane.id) {
         setDimensions({ cols, rows });
-        const script = `window.resizeTerminal && window.resizeTerminal(${cols}, ${rows}); true;`;
-        webViewRef.current?.injectJavaScript(script);
+        inject(`window.resizeTerminal && window.resizeTerminal(${cols}, ${rows}); true;`);
       }
     });
 
     const unsubSync = socketService.onTerminalSync((paneId, cols, rows, buffer) => {
       if (paneId === pane.id) {
         setDimensions({ cols, rows });
-        const script = `window.syncTerminal && window.syncTerminal(${cols}, ${rows}, ${JSON.stringify(buffer)}); true;`;
-        webViewRef.current?.injectJavaScript(script);
+        inject(`window.syncTerminal && window.syncTerminal(${cols}, ${rows}, ${JSON.stringify(buffer)}); true;`);
       }
     });
 
@@ -75,6 +89,26 @@ export const FocusedTerminalView: React.FC<FocusedTerminalViewProps> = ({
       unsubResize();
       unsubSync();
     };
+  }, [pane.id, inject]);
+
+  // Switching panes reuses the same WebView: repaint it from the replay buffer.
+  useEffect(() => {
+    const dims = socketService.getPaneDimensions(pane.id) || { cols: 80, rows: 24 };
+    inject(
+      `window.syncTerminal && window.syncTerminal(${dims.cols}, ${dims.rows}, ${JSON.stringify(socketService.getPaneOutput(pane.id))}); true;`
+    );
+  }, [pane.id, inject]);
+
+  const sendInput = useCallback((data: string) => {
+    if (ctrlRef.current) {
+      const chord = ctrlChord(data);
+      setCtrlActive(false);
+      if (chord !== null) {
+        socketService.sendTerminalInput(pane.id, chord);
+        return;
+      }
+    }
+    socketService.sendTerminalInput(pane.id, data);
   }, [pane.id]);
 
   const handleMessage = useCallback((event: any) => {
@@ -82,32 +116,41 @@ export const FocusedTerminalView: React.FC<FocusedTerminalViewProps> = ({
       const msg = JSON.parse(event.nativeEvent.data);
       if (msg.type === 'input') {
         // Direct keystroke from terminal emulator -> send to desktop PTY
-        socketService.sendTerminalInput(pane.id, msg.data);
+        sendInput(msg.data);
       } else if (msg.type === 'scale_change') {
         setScalePercent(Math.round(msg.scale * 100));
         if (msg.cols && msg.rows) {
           setDimensions({ cols: msg.cols, rows: msg.rows });
         }
       } else if (msg.type === 'ready') {
-        // WebView xterm is ready, populate with current replay buffer
+        // WebView xterm is ready: apply scale mode and populate with the replay buffer
+        readyRef.current = true;
         const dims = socketService.getPaneDimensions(pane.id) || { cols: 80, rows: 24 };
         const buffer = socketService.getPaneOutput(pane.id);
-        const script = `window.syncTerminal && window.syncTerminal(${dims.cols}, ${dims.rows}, ${JSON.stringify(buffer)}); true;`;
-        webViewRef.current?.injectJavaScript(script);
+        inject(`window.setScaleMode && window.setScaleMode('${scaleModeRef.current}'); true;`);
+        inject(`window.syncTerminal && window.syncTerminal(${dims.cols}, ${dims.rows}, ${JSON.stringify(buffer)}); true;`);
       }
     } catch {}
-  }, [pane.id]);
+  }, [pane.id, sendInput, inject]);
 
-  const handleVirtualKey = useCallback((key: string) => {
-    socketService.sendTerminalInput(pane.id, key);
-  }, [pane.id]);
+  const sendDraft = () => {
+    const line = draft;
+    if (line.trim()) {
+      historyRef.current = [line, ...historyRef.current.filter((h) => h !== line)].slice(0, 20);
+    }
+    socketService.sendTerminalInput(pane.id, `${line}\r`);
+    setDraft('');
+    try {
+      Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    } catch {}
+  };
 
   const changeScaleMode = (mode: ScaleMode) => {
     setScaleMode(mode);
     try {
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     } catch {}
-    webViewRef.current?.injectJavaScript(`window.setScaleMode && window.setScaleMode('${mode}'); true;`);
+    inject(`window.setScaleMode && window.setScaleMode('${mode}'); true;`);
   };
 
   const adjustZoom = (delta: number) => {
@@ -115,243 +158,17 @@ export const FocusedTerminalView: React.FC<FocusedTerminalViewProps> = ({
     try {
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     } catch {}
-    webViewRef.current?.injectJavaScript(`window.adjustZoom && window.adjustZoom(${delta}); true;`);
+    inject(`window.adjustZoom && window.adjustZoom(${delta}); true;`);
   };
 
   const focusTerminal = () => {
     try {
       Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
     } catch {}
-    webViewRef.current?.injectJavaScript(`window.focusTerminal && window.focusTerminal(); true;`);
+    inject(`window.focusTerminal && window.focusTerminal(); true;`);
   };
 
-  // Generate self-contained xterm.js live stream HTML with shellf-driving scaler
-  const htmlContent = `<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=5.0, user-scalable=yes">
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
-  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    html, body {
-      width: 100%;
-      height: 100%;
-      background: #070d14;
-      overflow: hidden;
-      font-family: ui-monospace, Menlo, Monaco, "Courier New", monospace;
-      -webkit-user-select: none;
-      user-select: none;
-    }
-    #container {
-      width: 100%;
-      height: 100%;
-      position: relative;
-      background: #070d14;
-      overflow: auto;
-      -webkit-overflow-scrolling: touch;
-      display: flex;
-      align-items: flex-start;
-      justify-content: flex-start;
-    }
-    #scaler {
-      transform-origin: top left;
-      transition: transform 0.12s ease-out;
-      display: inline-block;
-    }
-    .xterm {
-      padding: 4px;
-    }
-    #container::-webkit-scrollbar {
-      display: none;
-    }
-  </style>
-</head>
-<body>
-  <div id="container">
-    <div id="scaler">
-      <div id="terminal"></div>
-    </div>
-  </div>
 
-  <script>
-    let term = null;
-    let currentCols = ${dimensions.cols || 80};
-    let currentRows = ${dimensions.rows || 24};
-    let currentMode = '${scaleMode}';
-    let currentScale = 1.0;
-
-    function post(type, payload) {
-      if (window.ReactNativeWebView && window.ReactNativeWebView.postMessage) {
-        window.ReactNativeWebView.postMessage(JSON.stringify(Object.assign({ type: type }, payload || {})));
-      }
-    }
-
-    function init() {
-      term = new Terminal({
-        cols: currentCols,
-        rows: currentRows,
-        fontSize: 13,
-        lineHeight: 1.15,
-        fontFamily: 'ui-monospace, Menlo, Monaco, "Courier New", monospace',
-        theme: {
-          background: '#070d14',
-          foreground: '#d6e6f5',
-          cursor: '#00e5c8',
-          cursorAccent: '#070d14',
-          selectionBackground: 'rgba(0, 229, 200, 0.3)',
-          black: '#0a1017',
-          red: '#ff5c57',
-          green: '#5af78e',
-          yellow: '#f3f99d',
-          blue: '#57c7ff',
-          magenta: '#ff6ac1',
-          cyan: '#9aedfe',
-          white: '#f1f1f0',
-          brightBlack: '#686868',
-          brightRed: '#ff5c57',
-          brightGreen: '#5af78e',
-          brightYellow: '#f3f99d',
-          brightBlue: '#57c7ff',
-          brightMagenta: '#ff6ac1',
-          brightCyan: '#9aedfe',
-          brightWhite: '#eff0eb'
-        },
-        cursorBlink: true,
-        convertEol: false,
-        disableStdin: false,
-        allowTransparency: true
-      });
-
-      term.open(document.getElementById('terminal'));
-
-      // Raw keystroke stream from native mobile keyboard to desktop PTY
-      term.onData(function(data) {
-        post('input', { data: data });
-      });
-
-      // Configure helper textarea for seamless mobile terminal typing
-      setTimeout(function() {
-        const ta = document.querySelector('.xterm-helper-textarea');
-        if (ta) {
-          ta.setAttribute('autocapitalize', 'none');
-          ta.setAttribute('autocorrect', 'off');
-          ta.setAttribute('autocomplete', 'off');
-          ta.setAttribute('spellcheck', 'false');
-          ta.setAttribute('enterkeyhint', 'enter');
-        }
-        applyScale();
-        post('ready');
-      }, 60);
-
-      // Tapping anywhere focuses terminal and opens native keyboard
-      const container = document.getElementById('container');
-      container.addEventListener('click', function() {
-        if (term) term.focus();
-      });
-      container.addEventListener('touchend', function() {
-        if (term) term.focus();
-      });
-    }
-
-    // Dynamic shellf-driving scaler: matches exact PTY dimensions, scales visually
-    function applyScale() {
-      const scaler = document.getElementById('scaler');
-      const container = document.getElementById('container');
-      if (!term || !term.element || !scaler || !container) return;
-
-      scaler.style.transform = 'scale(1)';
-      const termW = term.element.offsetWidth || (currentCols * 7.8);
-      const termH = term.element.offsetHeight || (currentRows * 15.2);
-      const contW = container.clientWidth || window.innerWidth;
-      const contH = container.clientHeight || window.innerHeight;
-
-      if (!termW || !termH || !contW || !contH) return;
-
-      let s = 1.0;
-      if (currentMode === 'fit-screen') {
-        // Letterbox both dimensions: full desktop grid visible on phone
-        s = Math.max(0.15, Math.min(contW / termW, contH / termH, 3));
-      } else if (currentMode === 'fit-width') {
-        // Fit width: scales to phone width, allows vertical scrolling
-        s = Math.max(0.15, Math.min(contW / termW, 3));
-      } else if (currentMode === '100') {
-        s = 1.0;
-      } else if (currentMode === 'custom') {
-        s = currentScale;
-      }
-
-      currentScale = s;
-      scaler.style.transform = 'scale(' + s.toFixed(4) + ')';
-
-      post('scale_change', {
-        scale: s,
-        mode: currentMode,
-        cols: currentCols,
-        rows: currentRows
-      });
-    }
-
-    window.writeOutput = function(chunk) {
-      if (term && chunk) {
-        term.write(chunk);
-      }
-    };
-
-    window.syncTerminal = function(cols, rows, buffer) {
-      if (!term) return;
-      if (cols && rows && (cols !== currentCols || rows !== currentRows)) {
-        currentCols = cols;
-        currentRows = rows;
-        term.resize(cols, rows);
-      }
-      if (typeof buffer === 'string') {
-        term.reset();
-        if (buffer.length > 0) {
-          term.write(buffer);
-        }
-      }
-      applyScale();
-    };
-
-    window.resizeTerminal = function(cols, rows) {
-      if (!term || !cols || !rows) return;
-      currentCols = cols;
-      currentRows = rows;
-      term.resize(cols, rows);
-      applyScale();
-    };
-
-    window.setScaleMode = function(mode) {
-      currentMode = mode;
-      applyScale();
-    };
-
-    window.adjustZoom = function(delta) {
-      currentMode = 'custom';
-      currentScale = Math.max(0.2, Math.min(3.0, currentScale + delta));
-      applyScale();
-    };
-
-    window.focusTerminal = function() {
-      if (term) {
-        term.focus();
-      }
-    };
-
-    window.addEventListener('resize', function() {
-      applyScale();
-    });
-
-    document.addEventListener('DOMContentLoaded', init);
-    if (document.readyState === 'complete' || document.readyState === 'interactive') {
-      init();
-    }
-  </script>
-</body>
-</html>`;
 
   return (
     <KeyboardAvoidingView
@@ -411,7 +228,7 @@ export const FocusedTerminalView: React.FC<FocusedTerminalViewProps> = ({
             onPress={() => changeScaleMode('fit-width')}
           >
             <Text style={[styles.modeBtnText, scaleMode === 'fit-width' && styles.modeBtnTextActive]}>
-              Fit Width
+              Width
             </Text>
           </TouchableOpacity>
 
@@ -420,7 +237,7 @@ export const FocusedTerminalView: React.FC<FocusedTerminalViewProps> = ({
             onPress={() => changeScaleMode('fit-screen')}
           >
             <Text style={[styles.modeBtnText, scaleMode === 'fit-screen' && styles.modeBtnTextActive]}>
-              Fit Screen
+              Screen
             </Text>
           </TouchableOpacity>
 
@@ -429,7 +246,7 @@ export const FocusedTerminalView: React.FC<FocusedTerminalViewProps> = ({
             onPress={() => changeScaleMode('100')}
           >
             <Text style={[styles.modeBtnText, scaleMode === '100' && styles.modeBtnTextActive]}>
-              100%
+              1:1
             </Text>
           </TouchableOpacity>
         </View>
@@ -447,9 +264,19 @@ export const FocusedTerminalView: React.FC<FocusedTerminalViewProps> = ({
             <Text style={styles.zoomBtnText}>+</Text>
           </TouchableOpacity>
 
-          <TouchableOpacity style={styles.keyboardFocusBtn} onPress={focusTerminal}>
-            <Text style={styles.keyboardFocusText}>⌨ Type</Text>
+          <TouchableOpacity
+            style={[styles.keyboardFocusBtn, composeMode && styles.composeBtnActive]}
+            onPress={() => setComposeMode((v) => !v)}
+            accessibilityLabel="Toggle compose mode"
+          >
+            <Text style={[styles.keyboardFocusText, composeMode && styles.composeTextActive]}>✎</Text>
           </TouchableOpacity>
+
+          {!composeMode && (
+            <TouchableOpacity style={styles.keyboardFocusBtn} onPress={focusTerminal} accessibilityLabel="Type">
+              <Text style={styles.keyboardFocusText}>⌨</Text>
+            </TouchableOpacity>
+          )}
         </View>
       </View>
 
@@ -458,7 +285,11 @@ export const FocusedTerminalView: React.FC<FocusedTerminalViewProps> = ({
         <WebView
           ref={webViewRef}
           originWhitelist={['*']}
-          source={{ html: htmlContent }}
+          source={{ html: TERMINAL_HTML, baseUrl: 'https://localhost' }}
+          onContentProcessDidTerminate={() => {
+            readyRef.current = false;
+            webViewRef.current?.reload();
+          }}
           style={styles.webView}
           onMessage={handleMessage}
           scrollEnabled={true}
@@ -469,16 +300,97 @@ export const FocusedTerminalView: React.FC<FocusedTerminalViewProps> = ({
         />
       </View>
 
+      {composeMode && (
+        <View style={styles.composeBar}>
+          {historyRef.current.length > 0 && !draft && (
+            <TouchableOpacity style={styles.historyBtn} onPress={() => setDraft(historyRef.current[0])}>
+              <Text style={styles.historyText}>↑</Text>
+            </TouchableOpacity>
+          )}
+          <TextInput
+            style={styles.composeInput}
+            value={draft}
+            onChangeText={setDraft}
+            placeholder="Type a command or prompt, then Send"
+            placeholderTextColor="#4a657e"
+            autoCapitalize="none"
+            autoCorrect={false}
+            returnKeyType="send"
+            blurOnSubmit={false}
+            onSubmitEditing={sendDraft}
+            multiline={false}
+          />
+          <TouchableOpacity style={styles.sendBtn} onPress={sendDraft} accessibilityLabel="Send">
+            <Text style={styles.sendText}>Send</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
       {/* Native Mobile Virtual Keyboard Toolbar (Pinned directly above iOS keyboard) */}
       <VirtualKeyboard
-        onKey={handleVirtualKey}
-        onClear={() => socketService.clearPaneOutput(pane.id)}
+        onKey={sendInput}
+        ctrlActive={ctrlActive}
+        onToggleCtrl={() => setCtrlActive((v) => !v)}
+        onClear={() => {
+          socketService.clearPaneOutput(pane.id);
+          inject(`window.clearTerminal && window.clearTerminal(); true;`);
+        }}
       />
     </KeyboardAvoidingView>
   );
 };
 
 const styles = StyleSheet.create({
+  composeBtnActive: {
+    backgroundColor: '#00e5c8',
+  },
+  composeTextActive: {
+    color: '#05111c',
+  },
+  composeBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 8,
+    paddingVertical: 6,
+    backgroundColor: '#081422',
+    borderTopWidth: 1,
+    borderTopColor: '#13283c',
+  },
+  composeInput: {
+    flex: 1,
+    backgroundColor: '#050c16',
+    borderWidth: 1,
+    borderColor: '#193959',
+    borderRadius: 8,
+    color: '#d6e6f5',
+    fontFamily: 'Courier',
+    fontSize: 13,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+  },
+  sendBtn: {
+    backgroundColor: '#00e5c8',
+    borderRadius: 8,
+    paddingHorizontal: 14,
+    paddingVertical: 9,
+  },
+  sendText: {
+    color: '#05111c',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  historyBtn: {
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#193959',
+  },
+  historyText: {
+    color: '#00e5c8',
+    fontWeight: '700',
+  },
   container: {
     flex: 1,
     backgroundColor: '#050c16',
@@ -631,7 +543,7 @@ const styles = StyleSheet.create({
     lineHeight: 16,
   },
   percentBadge: {
-    minWidth: 42,
+    minWidth: 36,
     alignItems: 'center',
   },
   percentText: {

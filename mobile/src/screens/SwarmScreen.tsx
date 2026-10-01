@@ -9,7 +9,7 @@ import {
   Modal,
 } from 'react-native';
 import { socketService } from '../services/socketService';
-import type { SwarmRun, SwarmAgent } from '../types';
+import type { SwarmRun, SwarmAgent, AgentPresetInfo } from '../types';
 import * as Haptics from 'expo-haptics';
 
 export const SwarmScreen: React.FC = () => {
@@ -17,18 +17,33 @@ export const SwarmScreen: React.FC = () => {
   const [agents, setAgents] = useState<SwarmAgent[]>(socketService.swarmAgents);
   const [modalVisible, setModalVisible] = useState(false);
   const [promptText, setPromptText] = useState('');
+  const [presets, setPresets] = useState<AgentPresetInfo[]>(socketService.presets);
+  const [presetId, setPresetId] = useState<string | undefined>(undefined);
+  const [replyAgent, setReplyAgent] = useState<SwarmAgent | null>(null);
+  const [replyText, setReplyText] = useState('');
+
+  const sendReply = () => {
+    if (!replyAgent || !replyText.trim()) return;
+    socketService.sendAgentFollowUp(replyAgent, replyText.trim());
+    setReplyText('');
+    setReplyAgent(null);
+    try {
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    } catch {}
+  };
 
   useEffect(() => {
     const unsub = socketService.subscribe(() => {
       setRuns(socketService.swarmRuns);
       setAgents(socketService.swarmAgents);
+      setPresets(socketService.presets);
     });
     return unsub;
   }, []);
 
   const handleStartSwarm = () => {
     if (!promptText.trim()) return;
-    socketService.triggerSwarm(promptText.trim());
+    socketService.triggerSwarm(promptText.trim(), presetId);
     setPromptText('');
     setModalVisible(false);
     try {
@@ -102,7 +117,8 @@ export const SwarmScreen: React.FC = () => {
                 <View style={styles.agentSection}>
                   <Text style={styles.agentSectionTitle}>Agents ({runAgents.length}):</Text>
                   {runAgents.map((agent) => (
-                    <View key={agent.id} style={styles.agentRow}>
+                    <React.Fragment key={agent.id}>
+                    <View style={styles.agentRow}>
                       <View style={styles.agentInfo}>
                         <View
                           style={[
@@ -113,8 +129,34 @@ export const SwarmScreen: React.FC = () => {
                         />
                         <Text style={styles.agentRole}>{agent.role}</Text>
                       </View>
-                      <Text style={styles.agentStatus}>{agent.status}</Text>
+                      <View style={styles.agentActions}>
+                        {agent.status === 'running' && (
+                          <>
+                            <TouchableOpacity
+                              style={styles.agentActionBtn}
+                              onPress={() => setReplyAgent(agent)}
+                              accessibilityLabel={`Reply to ${agent.role}`}
+                            >
+                              <Text style={styles.agentActionText}>💬 Reply</Text>
+                            </TouchableOpacity>
+                            <TouchableOpacity
+                              style={[styles.agentActionBtn, styles.agentStopBtn]}
+                              onPress={() => socketService.killAgent(agent.id)}
+                              accessibilityLabel={`Stop ${agent.role}`}
+                            >
+                              <Text style={[styles.agentActionText, styles.agentStopText]}>■</Text>
+                            </TouchableOpacity>
+                          </>
+                        )}
+                        <Text style={styles.agentStatus}>{agent.status}</Text>
+                      </View>
                     </View>
+                    {agent.output_summary ? (
+                      <Text style={styles.agentSummary} numberOfLines={3}>
+                        {agent.output_summary}
+                      </Text>
+                    ) : null}
+                    </React.Fragment>
                   ))}
                 </View>
               </View>
@@ -123,8 +165,35 @@ export const SwarmScreen: React.FC = () => {
         )}
       </ScrollView>
 
+      {/* Follow-up to a running agent */}
+      <Modal visible={replyAgent !== null} transparent animationType="fade" onRequestClose={() => setReplyAgent(null)}>
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Message {replyAgent?.role}</Text>
+            <Text style={styles.modalSub}>Typed into the agent's terminal and sent with Enter.</Text>
+            <TextInput
+              style={styles.modalInput}
+              value={replyText}
+              onChangeText={setReplyText}
+              placeholder="e.g. Also add tests for the edge cases"
+              placeholderTextColor="#5a7690"
+              multiline
+              autoFocus
+            />
+            <View style={styles.modalActions}>
+              <TouchableOpacity style={styles.cancelBtn} onPress={() => setReplyAgent(null)}>
+                <Text style={styles.cancelText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.launchBtn} onPress={sendReply}>
+                <Text style={styles.launchText}>Send</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
       {/* New Swarm Run Modal */}
-      <Modal visible={modalVisible} transparent animationType="slide">
+      <Modal visible={modalVisible} transparent animationType="slide" onRequestClose={() => setModalVisible(false)}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
             <Text style={styles.modalTitle}>Launch AI Swarm Run</Text>
@@ -142,6 +211,23 @@ export const SwarmScreen: React.FC = () => {
               numberOfLines={4}
               textAlignVertical="top"
             />
+
+            {presets.length > 0 && (
+              <View style={styles.presetRow}>
+                {presets.map((p) => {
+                  const selected = (presetId ?? defaultPresetId(presets)) === p.id;
+                  return (
+                    <TouchableOpacity
+                      key={p.id}
+                      style={[styles.presetChip, selected && styles.presetChipActive]}
+                      onPress={() => setPresetId(p.id)}
+                    >
+                      <Text style={[styles.presetText, selected && styles.presetTextActive]}>{p.name}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </View>
+            )}
 
             <View style={styles.modalActions}>
               <TouchableOpacity
@@ -161,7 +247,68 @@ export const SwarmScreen: React.FC = () => {
   );
 };
 
+/** Mirrors the desktop's default: a builder-ish preset, else the first one. */
+function defaultPresetId(presets: AgentPresetInfo[]): string | undefined {
+  return (presets.find((p) => /build/i.test(p.role) || /build/i.test(p.name)) ?? presets[0])?.id;
+}
+
 const styles = StyleSheet.create({
+  agentActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  agentActionBtn: {
+    paddingHorizontal: 8,
+    paddingVertical: 3,
+    borderRadius: 5,
+    borderWidth: 1,
+    borderColor: '#1d3e5f',
+  },
+  agentActionText: {
+    color: '#00e5c8',
+    fontSize: 11,
+    fontWeight: '600',
+  },
+  agentStopBtn: {
+    borderColor: '#ff5252',
+  },
+  agentStopText: {
+    color: '#ff6b6b',
+  },
+  agentSummary: {
+    color: '#7f9db8',
+    fontSize: 11,
+    marginLeft: 14,
+    marginBottom: 6,
+  },
+  presetRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 6,
+    marginTop: 12,
+    marginBottom: 12,
+  },
+  presetChip: {
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#1d3e5f',
+    backgroundColor: '#0f243a',
+  },
+  presetChipActive: {
+    borderColor: '#00e5c8',
+    backgroundColor: 'rgba(0, 229, 200, 0.15)',
+  },
+  presetText: {
+    color: '#9cb5cc',
+    fontSize: 12,
+    fontWeight: '600',
+  },
+  presetTextActive: {
+    color: '#00e5c8',
+  },
   container: {
     flex: 1,
     backgroundColor: '#050c16',

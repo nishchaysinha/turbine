@@ -56,6 +56,12 @@ export interface SwarmAgent {
   output_summary: string | null;
 }
 
+export interface AgentPresetInfo {
+  id: string;
+  name: string;
+  role: string;
+}
+
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
 export type ActiveTab = 'workspace' | 'swarm' | 'tasks' | 'diffs' | 'settings';

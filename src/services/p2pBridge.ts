@@ -2,13 +2,25 @@ import { invoke } from '@tauri-apps/api/core';
 import { useWorkspaceStore } from '../state/workspaceStore';
 import { useTaskStore } from '../state/taskStore';
 import { useSwarmStore } from '../state/swarmStore';
+import { useAgentStore } from '../state/agentStore';
 import type { RelayConnectionStatus, RelaySessionInfo, RelayPeerInfo } from '../types/relay';
 
 type StatusListener = (status: RelayConnectionStatus) => void;
 type PeerListener = (peers: RelayPeerInfo[]) => void;
 type SessionListener = (session: RelaySessionInfo | null) => void;
 
-const DEFAULT_STUN_SERVERS: RTCIceServer[] = [
+export const DEFAULT_SIGNALING_URL = 'https://signaling-taupe.vercel.app';
+const SIGNALING_URL_KEY = 'turbine_signaling_url';
+const PAIRING_KEY = 'turbine_p2p_pairing';
+
+const ICE_GATHER_TIMEOUT_MS = 1500;
+const POLL_FAST_MS = 1500;
+const POLL_SLOW_MS = 8000;
+const POLL_FAST_WINDOW_MS = 3 * 60 * 1000;
+const REARM_DELAY_MS = 1000;
+const TERMINAL_BUFFER_BYTES = 256 * 1024;
+
+const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
   { urls: 'stun:openrelay.metered.ca:80' },
@@ -29,17 +41,60 @@ const DEFAULT_STUN_SERVERS: RTCIceServer[] = [
   },
 ];
 
+interface SavedPairing {
+  code: string;
+  token: string;
+  signalingUrl: string;
+}
+
+function readStorage(key: string): string | null {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStorage(key: string, value: string | null) {
+  try {
+    if (value === null) localStorage.removeItem(key);
+    else localStorage.setItem(key, value);
+  } catch {}
+}
+
+function loadSavedPairing(): SavedPairing | null {
+  try {
+    const parsed = JSON.parse(readStorage(PAIRING_KEY) || 'null');
+    if (parsed && typeof parsed.code === 'string' && typeof parsed.token === 'string') return parsed;
+  } catch {}
+  return null;
+}
+
+/**
+ * Desktop side of the mobile companion link. Publishes a WebRTC offer to the
+ * signaling service, waits for the phone's answer, then speaks the JSON
+ * `{ type, payload }` protocol over a single ordered DataChannel.
+ *
+ * The pairing code + token are remembered, so after the phone drops (or
+ * Turbine restarts) the same code is re-armed with a fresh offer and the
+ * phone can simply reconnect with it.
+ */
 export class P2PBridge {
   private pc: RTCPeerConnection | null = null;
   private dc: RTCDataChannel | null = null;
   private status: RelayConnectionStatus = 'disconnected';
   private session: RelaySessionInfo | null = null;
   private peers: RelayPeerInfo[] = [];
-  private signalingUrl: string = 'https://signaling-taupe.vercel.app';
+  private signalingUrl: string = DEFAULT_SIGNALING_URL;
   private activePaneId: string | null = null;
   private pollTimer: number | null = null;
   private pingTimer: number | null = null;
+  private rearmTimer: number | null = null;
   private latencyMs: number | null = null;
+  private offerVersion: number | null = null;
+  /** Incremented on every connect/disconnect so stale async work can bail out. */
+  private generation = 0;
+  private storeUnsubs: Array<() => void> = [];
   private terminalBuffers = new Map<string, string>();
   private terminalDimensions = new Map<string, { cols: number; rows: number }>();
 
@@ -48,7 +103,7 @@ export class P2PBridge {
   private sessionListeners = new Set<SessionListener>();
 
   constructor() {
-    const saved = localStorage.getItem('turbine_signaling_url');
+    const saved = readStorage(SIGNALING_URL_KEY);
     if (saved) {
       this.signalingUrl = saved;
     }
@@ -74,9 +129,13 @@ export class P2PBridge {
     return this.signalingUrl;
   }
 
+  public isConnected(): boolean {
+    return this.status === 'connected' && this.dc?.readyState === 'open';
+  }
+
   public setSignalingUrl(url: string) {
-    this.signalingUrl = url.trim().replace(/\/+$/, '');
-    localStorage.setItem('turbine_signaling_url', this.signalingUrl);
+    this.signalingUrl = url.trim().replace(/\/+$/, '') || DEFAULT_SIGNALING_URL;
+    writeStorage(SIGNALING_URL_KEY, this.signalingUrl);
   }
 
   public setActivePaneId(paneId: string | null) {
@@ -117,59 +176,60 @@ export class P2PBridge {
   }
 
   /**
-   * Initialize WebRTC PeerConnection, create DataChannel & Offer, and register with Vercel signaling.
+   * Create a fresh offer and register it with the signaling service.
+   * Reuses the remembered pairing code unless `fresh` is set.
    */
-  public async connect(customSignalingUrl?: string): Promise<RelaySessionInfo> {
+  public async connect(customSignalingUrl?: string, options: { fresh?: boolean } = {}): Promise<RelaySessionInfo> {
     if (customSignalingUrl) {
       this.setSignalingUrl(customSignalingUrl);
     }
-    this.disconnect();
+    if (options.fresh) {
+      writeStorage(PAIRING_KEY, null);
+    }
+    this.teardownPeer();
+    const gen = ++this.generation;
     this.setStatus('connecting');
 
     try {
-      const pc = new RTCPeerConnection({ iceServers: DEFAULT_STUN_SERVERS });
+      const pc = new RTCPeerConnection({ iceServers: DEFAULT_ICE_SERVERS });
       this.pc = pc;
 
-      // Create P2P DataChannel
       const dc = pc.createDataChannel('turbine-p2p', { ordered: true });
       this.dc = dc;
-      this.setupDataChannel(dc);
+      this.setupDataChannel(dc, gen);
 
-      // Collect local ICE candidates
+      pc.onconnectionstatechange = () => {
+        if (gen !== this.generation) return;
+        if (pc.connectionState === 'failed') {
+          this.handlePeerLost(gen);
+        }
+      };
+
       const localCandidates: RTCIceCandidateInit[] = [];
-      const icePromise = new Promise<void>((resolve) => {
+      const iceDone = new Promise<void>((resolve) => {
         pc.onicecandidate = (event) => {
           if (event.candidate) {
             localCandidates.push(event.candidate.toJSON());
           } else {
-            // ICE gathering complete
             resolve();
           }
         };
       });
 
-      // Create Offer
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      await Promise.race([iceDone, new Promise((r) => setTimeout(r, ICE_GATHER_TIMEOUT_MS))]);
+      if (gen !== this.generation) throw new Error('Pairing was cancelled');
 
-      // Wait up to 1 second for ICE gathering or proceed
-      await Promise.race([icePromise, new Promise((r) => setTimeout(r, 1200))]);
+      const result = await this.registerOffer(pc.localDescription, localCandidates);
+      if (gen !== this.generation) throw new Error('Pairing was cancelled');
 
-      // Post offer to Vercel serverless signaling endpoint
-      const resp = await fetch(`${this.signalingUrl}/api/pair/create`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          offer: pc.localDescription,
-          candidates: localCandidates,
-        }),
-      });
+      this.offerVersion = typeof result.offerVersion === 'number' ? result.offerVersion : null;
+      writeStorage(
+        PAIRING_KEY,
+        JSON.stringify({ code: result.code, token: result.token, signalingUrl: this.signalingUrl } satisfies SavedPairing),
+      );
 
-      if (!resp.ok) {
-        throw new Error(`Signaling error: ${resp.statusText}`);
-      }
-
-      const result = await resp.json();
       const sessionInfo: RelaySessionInfo = {
         sessionId: result.code,
         pairingCode: result.code,
@@ -178,27 +238,58 @@ export class P2PBridge {
         region: 'P2P (WebRTC)',
         expiresAt: result.expiresAt,
       };
-
       this.setSession(sessionInfo);
-
-      // Start polling Vercel signaling for mobile answer
-      this.startPollingAnswer(sessionInfo.pairingCode);
-
+      this.startPollingAnswer(sessionInfo, gen);
       return sessionInfo;
     } catch (err) {
-      this.setStatus('error');
+      if (gen === this.generation) {
+        this.teardownPeer();
+        this.setStatus('error');
+      }
       throw err;
     }
   }
 
-  private setupDataChannel(dc: RTCDataChannel) {
+  /** POST the offer, re-using the saved code when possible and falling back to a new one. */
+  private async registerOffer(
+    offer: RTCSessionDescription | null,
+    candidates: RTCIceCandidateInit[],
+  ): Promise<{ code: string; token: string; expiresAt: number; offerVersion?: number }> {
+    const saved = loadSavedPairing();
+    const reuse = saved && saved.signalingUrl === this.signalingUrl ? saved : null;
+
+    const post = (extra: Partial<SavedPairing>) =>
+      fetch(`${this.signalingUrl}/api/pair/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ offer, candidates, ...extra }),
+      });
+
+    let resp = await post(reuse ? { code: reuse.code, token: reuse.token } : {});
+    if (!resp.ok && reuse && resp.status >= 400 && resp.status < 500) {
+      // Code expired or taken: start over with a new one.
+      writeStorage(PAIRING_KEY, null);
+      resp = await post({});
+    }
+    if (!resp.ok) {
+      let detail = resp.statusText;
+      try {
+        detail = (await resp.json()).error || detail;
+      } catch {}
+      throw new Error(`Signaling error (${resp.status}): ${detail}`);
+    }
+    return resp.json();
+  }
+
+  private setupDataChannel(dc: RTCDataChannel, gen: number) {
     dc.onopen = () => {
+      if (gen !== this.generation) return;
       this.stopPollingAnswer();
       this.setStatus('connected');
       this.setPeers([{ role: 'mobile', deviceName: 'Direct Phone (P2P)', timestamp: Date.now() }]);
+      this.watchStores();
       this.syncFullState();
 
-      // Start direct P2P ping/pong latency measurement
       if (this.pingTimer) clearInterval(this.pingTimer);
       this.pingTimer = window.setInterval(() => {
         this.send('ping', { clientTime: Date.now() });
@@ -207,77 +298,117 @@ export class P2PBridge {
     };
 
     dc.onmessage = (event) => {
-      this.handleMessage(event.data);
+      if (gen !== this.generation) return;
+      void this.handleMessage(event.data);
     };
 
-    dc.onclose = () => {
-      this.setStatus('disconnected');
-      this.setPeers([]);
-      this.latencyMs = null;
-      if (this.pingTimer) {
-        clearInterval(this.pingTimer);
-        this.pingTimer = null;
-      }
-    };
+    dc.onclose = () => this.handlePeerLost(gen);
 
     dc.onerror = () => {
-      this.setStatus('error');
+      if (gen !== this.generation) return;
+      console.warn('[P2PBridge] DataChannel error');
     };
   }
 
-  private startPollingAnswer(code: string) {
+  /** The phone went away: re-arm the same pairing code so it can reconnect. */
+  private handlePeerLost(gen: number) {
+    if (gen !== this.generation) return;
+    this.teardownPeer();
+    this.setStatus('disconnected');
+    if (!this.session) return;
+
+    if (this.rearmTimer) clearTimeout(this.rearmTimer);
+    this.rearmTimer = window.setTimeout(() => {
+      this.rearmTimer = null;
+      if (gen !== this.generation) return;
+      this.connect().catch((e) => console.warn('[P2PBridge] Failed to re-arm pairing:', e));
+    }, REARM_DELAY_MS);
+  }
+
+  private startPollingAnswer(session: RelaySessionInfo, gen: number) {
     this.stopPollingAnswer();
+    const startedAt = Date.now();
+    const url = `${this.signalingUrl}/api/pair/${encodeURIComponent(session.pairingCode)}?token=${encodeURIComponent(session.token)}`;
 
     const checkAnswer = async () => {
-      if (!this.pc || this.status === 'connected') return;
-
+      if (gen !== this.generation || !this.pc || this.status === 'connected') return;
       try {
-        const resp = await fetch(`${this.signalingUrl}/api/pair/${code}`);
-        if (resp.ok) {
-          const data = await resp.json();
-          if (data.answer && this.pc && !this.pc.currentRemoteDescription) {
-            await this.pc.setRemoteDescription(new RTCSessionDescription(data.answer));
-
-            if (Array.isArray(data.answerCandidates)) {
-              for (const cand of data.answerCandidates) {
-                try {
-                  await this.pc.addIceCandidate(new RTCIceCandidate(cand));
-                } catch {}
-              }
-            }
-          }
+        const resp = await fetch(url);
+        if (gen !== this.generation) return;
+        if (resp.status === 404 || resp.status === 401) {
+          // Session expired or was taken over: get a brand new code.
+          this.connect(undefined, { fresh: true }).catch(() => {});
+          return;
+        }
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (gen !== this.generation || !this.pc || this.pc.currentRemoteDescription || !data.answer) return;
+        if (this.offerVersion !== null && data.offerVersion !== undefined && data.offerVersion !== this.offerVersion) {
+          return;
+        }
+        await this.pc.setRemoteDescription(new RTCSessionDescription(data.answer));
+        for (const cand of Array.isArray(data.answerCandidates) ? data.answerCandidates : []) {
+          try {
+            await this.pc.addIceCandidate(new RTCIceCandidate(cand));
+          } catch {}
         }
       } catch {}
     };
 
-    this.pollTimer = window.setInterval(checkAnswer, 1500);
-    checkAnswer();
+    const schedule = () => {
+      const delay = Date.now() - startedAt < POLL_FAST_WINDOW_MS ? POLL_FAST_MS : POLL_SLOW_MS;
+      this.pollTimer = window.setTimeout(async () => {
+        await checkAnswer();
+        if (gen === this.generation && this.pollTimer !== null && this.status !== 'connected') schedule();
+      }, delay);
+    };
+    void checkAnswer();
+    schedule();
   }
 
   private stopPollingAnswer() {
     if (this.pollTimer) {
-      clearInterval(this.pollTimer);
+      clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
   }
 
-  public disconnect() {
+  /** Close the peer connection but keep the session/pairing code. */
+  private teardownPeer() {
     this.stopPollingAnswer();
+    this.unwatchStores();
     if (this.pingTimer) {
       clearInterval(this.pingTimer);
       this.pingTimer = null;
     }
     if (this.dc) {
-      this.dc.close();
+      const dc = this.dc;
       this.dc = null;
+      dc.onopen = dc.onclose = dc.onmessage = dc.onerror = null;
+      try { dc.close(); } catch {}
     }
     if (this.pc) {
-      this.pc.close();
+      const pc = this.pc;
       this.pc = null;
+      pc.onicecandidate = null;
+      pc.onconnectionstatechange = null;
+      try { pc.close(); } catch {}
     }
-    this.setStatus('disconnected');
-    this.setPeers([]);
+    if (this.peers.length > 0) this.setPeers([]);
     this.latencyMs = null;
+  }
+
+  /** Stop pairing entirely. The remembered code stays valid for the next Start. */
+  public disconnect() {
+    this.generation++;
+    if (this.rearmTimer) {
+      clearTimeout(this.rearmTimer);
+      this.rearmTimer = null;
+    }
+    this.teardownPeer();
+    this.offerVersion = null;
+    this.setSession(null);
+    this.setStatus('disconnected');
   }
 
   public send(type: string, payload: unknown) {
@@ -287,6 +418,8 @@ export class P2PBridge {
   }
 
   public setTerminalDimensions(paneId: string, cols: number, rows: number) {
+    const prev = this.terminalDimensions.get(paneId);
+    if (prev && prev.cols === cols && prev.rows === rows) return;
     this.terminalDimensions.set(paneId, { cols, rows });
     this.send('terminal:resize', { paneId, cols, rows });
   }
@@ -301,75 +434,145 @@ export class P2PBridge {
 
   public sendTerminalOutput(paneId: string, data: string) {
     const cur = this.terminalBuffers.get(paneId) || '';
-    const updated = (cur + data).slice(-256 * 1024);
-    this.terminalBuffers.set(paneId, updated);
-
-    if (this.peers.length === 0) return;
+    this.terminalBuffers.set(paneId, (cur + data).slice(-TERMINAL_BUFFER_BYTES));
     this.send('terminal:output', { paneId, data });
   }
 
-  public syncFullState() {
-    const wsState = useWorkspaceStore.getState();
-    const taskState = useTaskStore.getState();
-    const swarmState = useSwarmStore.getState();
+  /** Forget buffered output for a pane that no longer exists. */
+  public forgetPane(paneId: string) {
+    this.terminalBuffers.delete(paneId);
+    this.terminalDimensions.delete(paneId);
+  }
 
+  private sendTerminalSync(paneId: string) {
+    const dims = this.terminalDimensions.get(paneId) || { cols: 80, rows: 24 };
+    this.send('terminal:sync', {
+      paneId,
+      cols: dims.cols,
+      rows: dims.rows,
+      buffer: this.terminalBuffers.get(paneId) || '',
+    });
+  }
+
+  private swarmSnapshot() {
+    const swarm = useSwarmStore.getState();
+    return {
+      runs: swarm.runs,
+      // `agents` is a Map keyed by run id; Maps serialise to `{}` so flatten it.
+      agents: Array.from(swarm.agents.values()).flat(),
+    };
+  }
+
+  /** Lightweight state push (no terminal buffers). Safe to call often. */
+  public syncState() {
+    if (!this.isConnected()) return;
+    const wsState = useWorkspaceStore.getState();
+    const { runs, agents } = this.swarmSnapshot();
     this.send('state:sync', {
       workspaces: wsState.workspaces,
       activeWorkspaceId: wsState.activeWorkspaceId,
-      tasks: taskState.tasks,
-      swarmRuns: swarmState.runs,
-      swarmAgents: swarmState.agents,
+      tasks: useTaskStore.getState().tasks,
+      swarmRuns: runs,
+      swarmAgents: agents,
+      presets: useAgentStore.getState().presets.map((p) => ({ id: p.id, name: p.name, role: p.role })),
       activePaneId: this.activePaneId,
     });
+  }
 
-    for (const [pId, dims] of this.terminalDimensions.entries()) {
-      const buf = this.terminalBuffers.get(pId) || '';
-      this.send('terminal:sync', {
-        paneId: pId,
-        cols: dims.cols,
-        rows: dims.rows,
-        buffer: buf,
-      });
+  /** Full state + every terminal's replay buffer. Sent once when the phone connects. */
+  public syncFullState() {
+    if (!this.isConnected()) return;
+    this.syncState();
+    for (const paneId of this.terminalDimensions.keys()) {
+      this.sendTerminalSync(paneId);
     }
   }
 
+  private watchStores() {
+    this.unwatchStores();
+    if (useAgentStore.getState().presets.length === 0) {
+      void useAgentStore.getState().loadPresets();
+    }
+
+    let tasksQueued = false;
+    let swarmQueued = false;
+    this.storeUnsubs.push(
+      useTaskStore.subscribe((s, prev) => {
+        if (s.tasks === prev.tasks || tasksQueued) return;
+        tasksQueued = true;
+        setTimeout(() => {
+          tasksQueued = false;
+          this.send('task:updated', { tasks: useTaskStore.getState().tasks });
+        }, 100);
+      }),
+      useSwarmStore.subscribe((s, prev) => {
+        if ((s.runs === prev.runs && s.agents === prev.agents) || swarmQueued) return;
+        swarmQueued = true;
+        setTimeout(() => {
+          swarmQueued = false;
+          this.send('swarm:updated', this.swarmSnapshot());
+        }, 100);
+      }),
+      useAgentStore.subscribe((s, prev) => {
+        if (s.presets !== prev.presets) this.syncState();
+      }),
+    );
+  }
+
+  private unwatchStores() {
+    this.storeUnsubs.forEach((fn) => fn());
+    this.storeUnsubs = [];
+  }
+
+  /**
+   * Resolve the directory a mobile command should act on. The phone only
+   * knows "." so map that to the focused pane's (or workspace's) directory.
+   */
+  public resolveProjectPath(requested?: unknown): string {
+    if (typeof requested === 'string' && requested && requested !== '.') return requested;
+    const ws = useWorkspaceStore.getState();
+    const active = ws.workspaces.find((w) => w.id === ws.activeWorkspaceId);
+    const panes = active?.panes ?? [];
+    const pane =
+      panes.find((p) => p.id === this.activePaneId && p.workingDirectory) ??
+      panes.find((p) => p.workingDirectory);
+    return pane?.workingDirectory || '.';
+  }
+
   private async handleMessage(raw: string) {
+    let msg: { type?: string; payload?: any };
     try {
-      const msg = JSON.parse(raw);
+      msg = JSON.parse(raw);
+    } catch {
+      console.warn('[P2PBridge] Ignoring malformed message');
+      return;
+    }
+
+    try {
+      const payload = msg.payload || {};
       switch (msg.type) {
         case 'terminal:request_sync': {
-          const { paneId } = msg.payload || {};
-          const targetPane = paneId || this.activePaneId;
-          if (targetPane) {
-            const dims = this.terminalDimensions.get(targetPane) || { cols: 80, rows: 24 };
-            const buf = this.terminalBuffers.get(targetPane) || '';
-            this.send('terminal:sync', {
-              paneId: targetPane,
-              cols: dims.cols,
-              rows: dims.rows,
-              buffer: buf,
-            });
-          }
+          const targetPane = payload.paneId || this.activePaneId;
+          if (targetPane) this.sendTerminalSync(targetPane);
           break;
         }
 
         case 'terminal:input': {
-          const { paneId, data } = msg.payload || {};
-          const targetPane = paneId || this.activePaneId;
-          if (targetPane && typeof data === 'string') {
-            const encoder = new TextEncoder();
+          const targetPane = payload.paneId || this.activePaneId;
+          if (targetPane && typeof payload.data === 'string') {
             await invoke('pty_write', {
               paneId: targetPane,
-              data: Array.from(encoder.encode(data)),
+              data: Array.from(new TextEncoder().encode(payload.data)),
             });
           }
           break;
         }
 
         case 'terminal:resize': {
-          const { paneId, cols, rows } = msg.payload || {};
-          const targetPane = paneId || this.activePaneId;
-          if (targetPane && cols && rows) {
+          const targetPane = payload.paneId || this.activePaneId;
+          const cols = Number(payload.cols);
+          const rows = Number(payload.rows);
+          if (targetPane && cols > 0 && rows > 0) {
             this.terminalDimensions.set(targetPane, { cols, rows });
             await invoke('pty_resize', { paneId: targetPane, cols, rows });
           }
@@ -377,78 +580,68 @@ export class P2PBridge {
         }
 
         case 'terminal:switch_pane': {
-          const { paneId } = msg.payload || {};
-          if (paneId) {
-            this.activePaneId = paneId;
-            const dims = this.terminalDimensions.get(paneId) || { cols: 80, rows: 24 };
-            const buf = this.terminalBuffers.get(paneId) || '';
-            this.send('terminal:sync', {
-              paneId,
-              cols: dims.cols,
-              rows: dims.rows,
-              buffer: buf,
-            });
+          if (payload.paneId) {
+            this.activePaneId = payload.paneId;
+            this.sendTerminalSync(payload.paneId);
           }
           break;
         }
 
         case 'workspace:switch': {
-          const { workspaceId } = msg.payload || {};
-          if (workspaceId) {
-            useWorkspaceStore.getState().switchWorkspace(workspaceId);
-            this.send('workspace:changed', { activeWorkspaceId: workspaceId });
+          if (payload.workspaceId) {
+            useWorkspaceStore.getState().switchWorkspace(payload.workspaceId);
+            this.send('workspace:changed', { activeWorkspaceId: useWorkspaceStore.getState().activeWorkspaceId });
           }
           break;
         }
 
         case 'task:update_status': {
-          const { id, status } = msg.payload || {};
+          const { id, status } = payload;
           if (id && status) {
             const taskStore = useTaskStore.getState();
             const existing = taskStore.tasks.find((t) => t.id === id);
             if (existing) {
               await taskStore.updateTask({ ...existing, status });
-              this.send('task:updated', { tasks: useTaskStore.getState().tasks });
             }
+            this.send('task:updated', { tasks: useTaskStore.getState().tasks });
           }
           break;
         }
 
         case 'task:create': {
-          const { title, projectPath } = msg.payload || {};
-          if (title) {
-            await useTaskStore.getState().createTask(projectPath || '.', title);
+          if (typeof payload.title === 'string' && payload.title.trim()) {
+            await useTaskStore.getState().createTask(this.resolveProjectPath(payload.projectPath), payload.title.trim());
             this.send('task:updated', { tasks: useTaskStore.getState().tasks });
           }
           break;
         }
 
         case 'diff:request': {
-          const { projectPath } = msg.payload || {};
+          const projectPath = this.resolveProjectPath(payload.projectPath);
           try {
-            const diff = await invoke<string>('get_git_diff', { projectPath: projectPath || '.' });
-            this.send('diff:data', { projectPath: projectPath || '.', diff });
-          } catch {
-            this.send('diff:data', { projectPath: projectPath || '.', diff: 'Unable to load git diff' });
+            const diff = await invoke<string>('get_git_diff', { path: projectPath });
+            this.send('diff:data', { projectPath, diff });
+          } catch (e) {
+            this.send('diff:data', { projectPath, diff: '', error: String(e) });
           }
           break;
         }
 
         case 'swarm:start': {
-          const { prompt } = msg.payload || {};
-          if (prompt) {
-            const swarm = useSwarmStore.getState();
-            await swarm.startAdHocRun('.', prompt);
-            this.send('swarm:updated', {
-              runs: useSwarmStore.getState().runs,
-              agents: useSwarmStore.getState().agents,
-            });
+          await this.startSwarm(payload);
+          break;
+        }
+
+        case 'swarm:kill_agent': {
+          if (typeof payload.agentId === 'string') {
+            await useSwarmStore.getState().killAgent(payload.agentId);
+            this.send('swarm:updated', this.swarmSnapshot());
           }
           break;
         }
 
         case 'pong': {
-          const { clientTime } = msg.payload || {};
+          const clientTime = Number(payload.clientTime);
           if (clientTime) {
             this.latencyMs = Math.max(1, Date.now() - clientTime);
             this.statusListeners.forEach((fn) => fn(this.status));
@@ -457,13 +650,36 @@ export class P2PBridge {
         }
 
         case 'ping': {
-          this.send('pong', { clientTime: msg.payload?.clientTime });
+          this.send('pong', { clientTime: payload.clientTime ?? (msg as any).timestamp });
           break;
         }
       }
     } catch (e) {
-      console.error('[P2PBridge] Failed to handle message:', e);
+      console.error('[P2PBridge] Failed to handle message:', msg.type, e);
+      this.send('error', { type: msg.type, message: e instanceof Error ? e.message : String(e) });
     }
+  }
+
+  /** Create a run and actually spawn an agent for it (a bare run does nothing). */
+  private async startSwarm(payload: { prompt?: unknown; presetId?: unknown; taskId?: unknown }) {
+    const prompt = typeof payload.prompt === 'string' ? payload.prompt.trim() : '';
+    if (!prompt) return;
+
+    const agentStore = useAgentStore.getState();
+    if (agentStore.presets.length === 0) await agentStore.loadPresets();
+    const presets = useAgentStore.getState().presets;
+    const preset =
+      presets.find((p) => p.id === payload.presetId) ??
+      presets.find((p) => /build/i.test(p.role) || /build/i.test(p.name)) ??
+      presets[0];
+    if (!preset) throw new Error('No agent presets configured on desktop');
+
+    const projectPath = this.resolveProjectPath();
+    const ws = useWorkspaceStore.getState();
+    const swarm = useSwarmStore.getState();
+    const run = await swarm.startAdHocRun(projectPath, prompt, ws.activeWorkspaceId ?? undefined, this.activePaneId);
+    await swarm.spawnAgent(run.id, preset.id, prompt, projectPath);
+    this.send('swarm:updated', this.swarmSnapshot());
   }
 }
 

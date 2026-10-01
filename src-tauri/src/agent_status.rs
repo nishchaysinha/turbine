@@ -272,7 +272,7 @@ pub fn posix_hook_script() -> String {
 # {HOOK_SCRIPT_MARKER}: reports agent lifecycle events to Turbine.
 # Usage: turbine-hook.sh <event> [source]   (event JSON on stdin)
 #        turbine-hook.sh exit <code>        (process exit marker)
-printf '{{}}\n'
+[ "$1" = "exit" ] || printf '{{}}\n'
 if [ -z "$TURBINE_PANE_ID" ] || [ -z "$TURBINE_HOOK_PORT" ]; then
   [ "$1" = "exit" ] || cat >/dev/null 2>&1
   exit 0
@@ -301,7 +301,7 @@ exit 0
 /// Windows variant (curl.exe ships with Windows 10+).
 pub fn windows_hook_script() -> String {
     format!(
-        "@echo off\r\nrem {HOOK_SCRIPT_MARKER}\r\necho {{}}\r\nif \"%TURBINE_PANE_ID%\"==\"\" exit /b 0\r\nif \"%1\"==\"exit\" (\r\n  curl.exe -s -m 2 -o NUL -X POST -H \"X-Turbine-Token: %TURBINE_HOOK_TOKEN%\" -H \"Content-Type: application/json\" --data \"{{\\\"exit_code\\\":%2}}\" \"http://127.0.0.1:%TURBINE_HOOK_PORT%/hook?pane=%TURBINE_PANE_ID%&event=exit&source=turbine\"\r\n  exit /b 0\r\n)\r\nset SRC=%2\r\nif \"%SRC%\"==\"\" set SRC=claude\r\ncurl.exe -s -m 2 -o NUL -X POST -H \"X-Turbine-Token: %TURBINE_HOOK_TOKEN%\" -H \"Content-Type: application/json\" --data-binary @- \"http://127.0.0.1:%TURBINE_HOOK_PORT%/hook?pane=%TURBINE_PANE_ID%&event=%1&source=%SRC%\"\r\nexit /b 0\r\n"
+        "@echo off\r\nrem {HOOK_SCRIPT_MARKER}\r\nif not \"%1\"==\"exit\" echo {{}}\r\nif \"%TURBINE_PANE_ID%\"==\"\" exit /b 0\r\nif \"%1\"==\"exit\" (\r\n  curl.exe -s -m 2 -o NUL -X POST -H \"X-Turbine-Token: %TURBINE_HOOK_TOKEN%\" -H \"Content-Type: application/json\" --data \"{{\\\"exit_code\\\":%2}}\" \"http://127.0.0.1:%TURBINE_HOOK_PORT%/hook?pane=%TURBINE_PANE_ID%&event=exit&source=turbine\"\r\n  exit /b 0\r\n)\r\nset SRC=%2\r\nif \"%SRC%\"==\"\" set SRC=claude\r\ncurl.exe -s -m 2 -o NUL -X POST -H \"X-Turbine-Token: %TURBINE_HOOK_TOKEN%\" -H \"Content-Type: application/json\" --data-binary @- \"http://127.0.0.1:%TURBINE_HOOK_PORT%/hook?pane=%TURBINE_PANE_ID%&event=%1&source=%SRC%\"\r\nexit /b 0\r\n"
     )
 }
 

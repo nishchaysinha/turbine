@@ -34,6 +34,7 @@ import { ShortcutSheet } from './components/overlays/ShortcutSheet';
 import { CompanionModal } from './components/overlays/CompanionModal';
 import { p2pBridge } from './services/p2pBridge';
 import { AGENT_STATE_LABELS, useAgentStatusStore, withExitMarker } from './state/agentStatusStore';
+import { useTaskStore } from './state/taskStore';
 import './App.css';
 
 function replaceLeafPaneId(node: import('./types').LayoutNode, fromId: string, toId: string): import('./types').LayoutNode {
@@ -409,7 +410,7 @@ function App() {
         const pane = createDefaultPane(activeWorkspaceId);
         pane.id = newPaneId;
         pane.type = 'terminal';
-        pane.startupCommand = command;
+        pane.startupCommand = withExitMarker(command);
         pane.autoLaunch = true;
         pane.workingDirectory = workspaceRoot || '.';
         pane.label = `${agentLabel}: ${task.title}`;
@@ -427,6 +428,7 @@ function App() {
           ),
         }));
         setFocusedPaneId(newPaneId);
+        if (task.status === 'todo') void useTaskStore.getState().updateTask({ ...task, status: 'in_progress' });
       }
     },
     [activeWorkspace, activeWorkspaceId, focusedPaneId, workspaceRoot],

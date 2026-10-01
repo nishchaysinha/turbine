@@ -3,6 +3,7 @@ import { useTaskStore } from '../../state/taskStore';
 import { useWorkspaceStore } from '../../state/workspaceStore';
 import type { Task, TaskStatus } from '../../types';
 import { DEFAULT_BOARD_COLUMNS } from '../../types';
+import { shellQuote } from '../../utils/shellQuote';
 import './TaskBoard.css';
 
 export interface AgentCli {
@@ -11,37 +12,13 @@ export interface AgentCli {
   buildCommand: (task: Task) => string;
 }
 
+const taskPrompt = (task: Task) => shellQuote(task.description ? `${task.title}. ${task.description}` : task.title);
+
+// Interactive sessions, so the agent can ask for permission and be steered from the command center.
 export const BUILTIN_AGENTS: AgentCli[] = [
-  {
-    id: 'claude',
-    label: 'Claude Code',
-    buildCommand: (task) => {
-      const prompt = task.description
-        ? `${task.title}. ${task.description}`
-        : task.title;
-      return `claude -p ${JSON.stringify(prompt)}`;
-    },
-  },
-  {
-    id: 'gemini',
-    label: 'Gemini CLI',
-    buildCommand: (task) => {
-      const prompt = task.description
-        ? `${task.title}. ${task.description}`
-        : task.title;
-      return `gemini -p ${JSON.stringify(prompt)}`;
-    },
-  },
-  {
-    id: 'codex',
-    label: 'Codex',
-    buildCommand: (task) => {
-      const prompt = task.description
-        ? `${task.title}. ${task.description}`
-        : task.title;
-      return `codex ${JSON.stringify(prompt)}`;
-    },
-  },
+  { id: 'claude', label: 'Claude Code', buildCommand: (task) => `claude ${taskPrompt(task)}` },
+  { id: 'gemini', label: 'Gemini CLI', buildCommand: (task) => `gemini -i ${taskPrompt(task)}` },
+  { id: 'codex', label: 'Codex', buildCommand: (task) => `codex ${taskPrompt(task)}` },
 ];
 
 export interface RunTaskRequest {

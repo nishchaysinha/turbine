@@ -296,6 +296,41 @@ async function main() {
     shot('swarm-interrupted', 'Swarm runs whose agents died with the app show as Failed (interrupted) instead of running forever');
   });
 
+  await step('Task board: create, run with an agent; hostile titles stay literal', async () => {
+    const res = await ev(`
+      document.querySelector('[aria-label="Tasks"]').click();
+      await new Promise((r) => setTimeout(r, 800));
+      const input = document.querySelector('.task-board__add-form input');
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, 'Fix "it\\'s" $(touch /tmp/turbine-e2e-task-pwned) \\\`id\\\`');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 100));
+      input.form.requestSubmit();
+      await new Promise((r) => setTimeout(r, 600));
+      const card = [...document.querySelectorAll('.task-board [draggable=true]')].find((c) => c.innerText.includes('task-pwned'));
+      card.querySelector('button').click();
+      await new Promise((r) => setTimeout(r, 300));
+      [...document.querySelectorAll('.task-board__agent-selector button')].find((b) => b.innerText.includes('Gemini')).click();
+      const T = window.__turbine;
+      for (let i = 0; i < 40; i++) {
+        await new Promise((r) => setTimeout(r, 250));
+        const ws = T.workspace.getState().workspaces.find((w) => w.id === T.workspace.getState().activeWorkspaceId);
+        const pane = ws.panes.find((p) => p.label?.startsWith('Gemini CLI'));
+        const row = pane && T.agentStatus.getState().rows[pane.id];
+        if (row?.exitCode != null) {
+          const t = window.__turbineTerminals.get(pane.id).terminal.buffer.active;
+          let text = ''; for (let j = 0; j < t.length; j++) text += (t.getLine(j)?.translateToString(true) ?? '') + '\\n';
+          return { state: row.state, exit: row.exitCode, task: T.tasks.getState().tasks.find((x) => x.title.includes('task-pwned')).status, text };
+        }
+      }
+      return { state: 'none' };`);
+    assert(res.state === 'done' && typeof res.exit === 'number', `agent pane reported its exit: ${JSON.stringify(res).slice(0, 300)}`);
+    assert(res.task === 'in_progress', `task moved to in progress: ${res.task}`);
+    assert(!existsSync('/tmp/turbine-e2e-task-pwned'), 'no command injection from task title');
+    assert(!/^\{\}$/m.test(res.text), 'exit marker prints nothing');
+    await sleep(1500);
+    shot('task-run', 'Task board → Run with an agent: the title is passed literally and the pane reports its exit');
+  });
+
   await step('Settings: hook install toggle and renderer switch', async () => {
     const text = await ev(`
       document.querySelector('[aria-label="Settings"]').click();

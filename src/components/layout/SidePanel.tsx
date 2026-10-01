@@ -1,3 +1,4 @@
+import { AgentsPanel } from '../agents/AgentsPanel';
 import { useState, useRef, useCallback } from 'react';
 import { FileBrowser } from '../viewers/FileBrowser';
 import { TaskBoard, type RunTaskRequest } from '../viewers/TaskBoard';
@@ -11,6 +12,7 @@ const MAX_WIDTH = 600;
 const DEFAULT_WIDTH = 240;
 
 interface SidePanelProps {
+  onFocusPane: (workspaceId: string, paneId: string) => void;
   activePanel: SidePanelId | null;
   workspaceId: string | null;
   focusedPaneId: string | null;
@@ -32,6 +34,7 @@ export function SidePanel({
   onOpenFile,
   onRefresh,
   onRunTask,
+  onFocusPane,
 }: SidePanelProps) {
   const [width, setWidth] = useState(DEFAULT_WIDTH);
   const [dragging, setDragging] = useState(false);
@@ -72,6 +75,7 @@ export function SidePanel({
       style={isOpen ? { width } : undefined}
     >
       <div className="side-panel__content">
+        {activePanel === 'agents' && <AgentsPanel onFocusPane={onFocusPane} />}
         {activePanel === 'files' && (
           <FileBrowser
             rootPath={rootPath}

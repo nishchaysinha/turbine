@@ -9,6 +9,7 @@ import { findLeafIds, movePane, resizeAtPath, createCodeAndConsolePreset, create
 import { useBroadcast } from './hooks/useBroadcast';
 import { usePtyStatusListener } from './hooks/usePtyStatus';
 import { usePtyAttentionListener } from './hooks/usePtyAttention';
+import { useAgentNotifications } from './hooks/useAgentNotifications';
 import { useAppStartup } from './hooks/useAppStartup';
 import { useWorkspaceKeybindings } from './hooks/useWorkspaceKeybindings';
 import { TabBar } from './components/layout/TabBar';
@@ -145,6 +146,14 @@ function App() {
   usePtyStatusListener();
   // Surface a native notification when an unfocused pane signals attention (BEL)
   usePtyAttentionListener(focusedPaneId);
+  useAgentNotifications(focusedPaneId);
+
+  const handleFocusAgentPane = useCallback((workspaceId: string, paneId: string) => {
+    setShowHome(false);
+    useWorkspaceStore.getState().switchWorkspace(workspaceId);
+    setFocusedPaneId(paneId);
+    useAgentStatusStore.getState().markRead(paneId);
+  }, []);
   const loading = useAppStartup(createWorkspace);
 
   // Only pass broadcastWrite when broadcast mode is active
@@ -885,6 +894,7 @@ function App() {
             onOpenFile={handleOpenFile}
             onRefresh={handleRefreshProjectFiles}
             onRunTask={handleRunTaskCommand}
+            onFocusPane={handleFocusAgentPane}
           />
           <div className="app__workspace">
             {showHome || workspaces.length === 0 ? (

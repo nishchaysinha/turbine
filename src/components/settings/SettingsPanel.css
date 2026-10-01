@@ -295,3 +295,14 @@
   font-size: 12px;
   color: var(--color-accent, #00e5c8);
 }
+
+.settings-panel__hint { margin: -4px 0 12px; font-size: 11px; line-height: 1.5; color: var(--color-fg-muted, #6b8a9e); }
+.settings-panel__hint code { color: var(--color-fg, #c8dce8); word-break: break-all; }
+.settings-panel__hint--error { color: var(--color-danger, #ff5c5c); }
+
+.settings-panel__button {
+  background: transparent; color: var(--color-fg, #c8dce8); border: 1px solid var(--pane-border, #1a3550);
+  border-radius: 6px; padding: 5px 12px; font: inherit; font-size: 12px; cursor: pointer;
+}
+.settings-panel__button:hover { border-color: var(--color-accent, #00e5c8); color: var(--color-accent, #00e5c8); }
+.settings-panel__button:disabled { opacity: 0.5; cursor: default; }

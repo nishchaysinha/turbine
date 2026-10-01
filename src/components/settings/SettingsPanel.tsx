@@ -8,13 +8,16 @@ import {
   persistCustomTheme,
 } from '../../themes/themeEngine';
 import type { Action } from '../../state/keybindingManager';
+import { useAgentStatusStore } from '../../state/agentStatusStore';
+import { gpuRenderingEnabled } from '../terminal/TerminalPane';
 import './SettingsPanel.css';
 
-type Section = 'general' | 'terminal' | 'keybindings';
+type Section = 'general' | 'terminal' | 'agents' | 'keybindings';
 
 const SECTIONS: { id: Section; label: string }[] = [
   { id: 'general', label: 'General' },
   { id: 'terminal', label: 'Terminal' },
+  { id: 'agents', label: 'Agents' },
   { id: 'keybindings', label: 'Keybindings' },
 ];
 
@@ -109,6 +112,7 @@ export function SettingsPanel({ onClose }: SettingsPanelProps) {
         <div className="settings-panel__content" role="tabpanel" aria-label={`${activeSection} settings`}>
           {activeSection === 'general' && <GeneralSection />}
           {activeSection === 'terminal' && <TerminalSection />}
+          {activeSection === 'agents' && <AgentsSection />}
           {activeSection === 'keybindings' && <KeybindingsSection />}
         </div>
       </div>
@@ -293,6 +297,63 @@ function TerminalSection() {
           onBlur={handleBlur}
         />
       </div>
+    </>
+  );
+}
+
+/* ---------- Agents Section ---------- */
+
+function AgentsSection() {
+  const hooks = useAgentStatusStore((s) => s.hooks);
+  const setClaudeHooks = useAgentStatusStore((s) => s.setClaudeHooks);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [gpu, setGpu] = useState(gpuRenderingEnabled());
+
+  const toggleHooks = async () => {
+    if (!hooks) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await setClaudeHooks(!hooks.claudeInstalled);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const toggleGpu = () => {
+    const next = !gpu;
+    try {
+      if (next) localStorage.removeItem('turbine.terminalRenderer');
+      else localStorage.setItem('turbine.terminalRenderer', 'dom');
+    } catch {}
+    setGpu(next);
+  };
+
+  return (
+    <>
+      <h3 className="settings-panel__section-title">Agents</h3>
+      <div className="settings-panel__field">
+        <label className="settings-panel__label">Claude Code status hooks</label>
+        <button className="settings-panel__button" onClick={toggleHooks} disabled={busy || !hooks}>
+          {busy ? 'Working…' : hooks?.claudeInstalled ? 'Remove hooks' : 'Install hooks'}
+        </button>
+      </div>
+      <p className="settings-panel__hint">
+        {hooks?.claudeInstalled ? 'Installed in ' : 'Lets agents report working / needs-permission / done to Turbine and your phone. Writes to '}
+        <code>{hooks?.claudeSettingsPath ?? '~/.claude/settings.json'}</code>
+        {hooks?.claudeInstalled ? '.' : ' (existing hooks are kept, a backup is saved).'}
+      </p>
+      {error && <p className="settings-panel__hint settings-panel__hint--error">{error}</p>}
+      <div className="settings-panel__field">
+        <label className="settings-panel__label">GPU terminal rendering</label>
+        <button className="settings-panel__button" onClick={toggleGpu}>
+          {gpu ? 'On (WebGL)' : 'Off (DOM)'}
+        </button>
+      </div>
+      <p className="settings-panel__hint">Turn off if terminals show stale or garbled text. Applies to newly opened panes.</p>
     </>
   );
 }

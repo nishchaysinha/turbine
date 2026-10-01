@@ -1,3 +1,4 @@
+import { WorkspaceAgentDot } from '../agents/AgentStatusChip';
 import { useState, useRef, useCallback } from 'react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { useWorkspaceStore } from '../../state/workspaceStore';
@@ -166,6 +167,7 @@ export function TabBar({ onContextMenu, onApplyTemplate, homeActive, onHomeClick
                 />
               ) : (
                 <span className="tab-bar__tab-content">
+                  <WorkspaceAgentDot paneIds={ws.panes.map((p) => p.id)} />
                   <span
                     className="tab-bar__tab-name"
                     onDoubleClick={() => handleDoubleClick(ws)}

@@ -11,6 +11,7 @@ import { DiffViewer } from '../viewers/DiffViewer';
 import { SwarmPanel } from '../swarm/SwarmPanel';
 import { LogDashboardPane } from '../panes/log-dashboard';
 import { PaneToolbar } from './PaneToolbar';
+import { AgentStatusChip } from '../agents/AgentStatusChip';
 import { CloseConfirmDialog } from '../overlays/CloseConfirmDialog';
 import { usePaneStatus } from '../../hooks/usePtyStatus';
 import { usePtyStatusStore } from '../../hooks/usePtyStatus';
@@ -487,6 +488,7 @@ function LeafPane({
           {!isEditingTitle && pane.title && (
             <span className="pane-title-type">{getPaneTypeLabel(pane)}</span>
           )}
+          {pane.type === 'terminal' && <AgentStatusChip paneId={pane.id} />}
           <button
             className="pane-title-bar__close"
             onClick={handleClosePane}

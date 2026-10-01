@@ -7,6 +7,7 @@ import {
   sendNotification,
 } from '@tauri-apps/plugin-notification';
 import { useWorkspaceStore } from '../state/workspaceStore';
+import { useAgentStatusStore } from '../state/agentStatusStore';
 
 /** Per-pane suppression window — one notification per this many ms. */
 const PER_PANE_THROTTLE_MS = 5000;
@@ -58,6 +59,9 @@ export function usePtyAttentionListener(focusedPaneId: string | null) {
     appWindow
       .listen<{ pane_id: string }>('pty_attention', async (event) => {
         const { pane_id } = event.payload;
+        // Hook-reported agents get precise notifications from the status hub;
+        // the BEL heuristic is only a fallback for agents without hooks.
+        if (useAgentStatusStore.getState().rows[pane_id]) return;
 
         // Suppress if the pane is currently focused AND the window is focused.
         let windowFocused = false;

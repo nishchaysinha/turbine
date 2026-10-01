@@ -1,6 +1,7 @@
 import './ActivityBar.css';
+import { useAgentStatusStore } from '../../state/agentStatusStore';
 
-export type SidePanelId = 'files' | 'tasks' | 'swarm';
+export type SidePanelId = 'agents' | 'files' | 'tasks' | 'swarm';
 
 interface ActivityBarProps {
   activePanel: SidePanelId | null;
@@ -11,6 +12,16 @@ interface ActivityBarProps {
   broadcastMode: boolean;
   onToggleBroadcast: () => void;
 }
+
+const AgentsIcon = () => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="3" y="4" width="18" height="12" rx="2"/>
+    <polyline points="7 9 9 11 7 13"/>
+    <line x1="11" y1="13" x2="15" y2="13"/>
+    <line x1="8" y1="20" x2="16" y2="20"/>
+    <line x1="12" y1="16" x2="12" y2="20"/>
+  </svg>
+);
 
 const FilesIcon = () => (
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
@@ -69,11 +80,12 @@ interface BarItemProps {
   description: string;
   active?: boolean;
   highlight?: boolean;
+  badge?: number;
   onClick: () => void;
   className?: string;
 }
 
-function BarItem({ icon, label, description, active, highlight, onClick, className }: BarItemProps) {
+function BarItem({ icon, label, description, active, highlight, badge, onClick, className }: BarItemProps) {
   const cls = [
     'activity-bar__btn',
     active && 'activity-bar__btn--active',
@@ -83,8 +95,9 @@ function BarItem({ icon, label, description, active, highlight, onClick, classNa
 
   return (
     <div className="activity-bar__item">
-      <button className={cls} onClick={onClick}>
+      <button className={cls} onClick={onClick} aria-label={label}>
         {icon}
+        {badge ? <span className="activity-bar__badge">{badge}</span> : null}
       </button>
       <div className="activity-bar__tooltip">
         <span className="activity-bar__tooltip-label">{label}</span>
@@ -95,6 +108,7 @@ function BarItem({ icon, label, description, active, highlight, onClick, classNa
 }
 
 const PANELS: { id: SidePanelId; label: string; description: string; Icon: React.FC }[] = [
+  { id: 'agents', label: 'Agents', description: 'Every agent, what it is doing, what it needs', Icon: AgentsIcon },
   { id: 'files', label: 'Files', description: 'Browse project files', Icon: FilesIcon },
   { id: 'tasks', label: 'Tasks', description: 'Manage tasks and agents', Icon: TasksIcon },
   { id: 'swarm', label: 'Swarm', description: 'Monitor agent swarm runs', Icon: SwarmIcon },
@@ -109,6 +123,7 @@ export function ActivityBar({
   broadcastMode,
   onToggleBroadcast,
 }: ActivityBarProps) {
+  const needsYou = useAgentStatusStore((s) => Object.values(s.rows).filter((r) => r.state === 'blocked').length);
   return (
     <div className="activity-bar">
       <div className="activity-bar__top">
@@ -119,6 +134,7 @@ export function ActivityBar({
             label={label}
             description={description}
             active={activePanel === id}
+            badge={id === 'agents' ? needsYou : undefined}
             onClick={() => onPanelToggle(id)}
           />
         ))}

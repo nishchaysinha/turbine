@@ -1,6 +1,6 @@
 import type { Workspace, Task, SwarmRun, SwarmAgent, AgentPresetInfo, ConnectionStatus } from '../types';
 import { getWebRTCBridge } from './bridgeRegistry';
-import { normalizePairingCode, normalizeSignalingUrl } from '../utils/pairing';
+import { normalizeLanUrl, normalizePairingCode, normalizeSignalingUrl, type LanTarget } from '../utils/pairing';
 import type { DirectoryCache, FileEntry } from '../utils/fileTree';
 import type { HistoryRun } from '../utils/history';
 import { bracketedPaste } from '../utils/review';
@@ -92,6 +92,9 @@ export class SocketService {
   public paneDimensions: Map<string, { cols: number; rows: number }> = new Map();
   public currentServerUrl: string = DEFAULT_SIGNALING_URL;
   public pairingCode: string = '';
+  /** Set when connected (or connecting) over the desktop's LAN WebSocket instead of WebRTC. */
+  public lanTarget: LanTarget | null = null;
+  private ws: WebSocket | null = null;
   public connectionMode: 'p2p' = 'p2p';
   public latencyMs: number | null = null;
   /** True while we lost the desktop and are retrying with the same code. */
@@ -212,14 +215,57 @@ export class SocketService {
 
     this.disconnect();
     this.wantConnected = true;
+    this.lanTarget = null;
     this.currentServerUrl = url;
     this.pairingCode = code;
     this.busyRetriesLeft = BUSY_RETRIES;
     return this.startAttempt();
   }
 
+  /**
+   * Direct connection to the desktop over the local network (its Rust
+   * WebSocket server). Same protocol, reconnect and timeouts as WebRTC.
+   */
+  public connectLan({ url, token }: LanTarget): Promise<void> {
+    const target = { url: normalizeLanUrl(url), token: token.trim() };
+    if (!target.url || !target.token) return Promise.reject(new Error('Enter the address and token shown in Turbine.'));
+    this.disconnect();
+    this.wantConnected = true;
+    this.lanTarget = target;
+    this.pairingCode = '';
+    this.busyRetriesLeft = 0;
+    return this.startAttempt();
+  }
+
+  private connectWebSocket(target: LanTarget) {
+    const WS = (globalThis as { WebSocket?: typeof WebSocket }).WebSocket;
+    if (!WS) throw new Error('WebSocket is not available');
+    const ws = new WS(`${target.url}/?token=${encodeURIComponent(target.token)}`);
+    this.ws = ws;
+    let opened = false;
+    ws.onopen = () => {
+      if (this.ws !== ws) return;
+      opened = true;
+      this.startPing();
+      this.setStatus('connected');
+    };
+    ws.onmessage = (e: MessageEvent) => {
+      if (this.ws === ws && typeof e.data === 'string') this.handleMessage(e.data);
+    };
+    ws.onerror = () => {
+      if (this.ws !== ws || opened) return;
+      this.setErrorMessage(`Could not reach the desktop at ${target.url}. Check the address, token and that both are on the same network.`);
+    };
+    ws.onclose = () => {
+      if (this.ws !== ws) return;
+      this.ws = null;
+      this.stopPing();
+      if (opened) this.setStatus('disconnected');
+    };
+  }
+
   private startAttempt(): Promise<void> {
-    this.log(`Connecting to ${this.pairingCode} via ${this.currentServerUrl}`);
+    this.log(this.lanTarget ? `Connecting over LAN to ${this.lanTarget.url}` : `Connecting to ${this.pairingCode} via ${this.currentServerUrl}`);
     this.status = 'connecting';
     this.errorMessage = null;
     this.notify();
@@ -244,6 +290,14 @@ export class SocketService {
       );
     }, CONNECT_TIMEOUT_MS);
 
+    if (this.lanTarget) {
+      try {
+        this.connectWebSocket(this.lanTarget);
+      } catch (e) {
+        this.failPendingConnect(e instanceof Error ? e.message : String(e));
+      }
+      return promise;
+    }
     const bridge = getWebRTCBridge();
     if (bridge) {
       bridge.connect(this.currentServerUrl, this.pairingCode);
@@ -388,6 +442,11 @@ export class SocketService {
 
   private teardownTransport() {
     this.stopPing();
+    if (this.ws) {
+      const ws = this.ws;
+      this.ws = null;
+      try { ws.close(); } catch {}
+    }
     this.failAllRpc('Disconnected');
     this.hostCapabilities = new Set();
     this.hostProtocol = null;
@@ -440,6 +499,10 @@ export class SocketService {
 
   public send(type: string, payload: unknown) {
     const serialized = JSON.stringify({ type, payload, timestamp: Date.now() });
+    if (this.ws) {
+      if (this.ws.readyState === 1) this.ws.send(serialized);
+      return;
+    }
     const bridge = getWebRTCBridge();
     if (bridge) {
       bridge.send(serialized);

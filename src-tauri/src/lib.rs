@@ -1,6 +1,7 @@
 pub mod agent_command;
 pub mod agent_status;
 pub mod commands;
+pub mod companion_lan;
 pub mod db;
 pub mod debug_bridge;
 pub mod file_ops;
@@ -26,6 +27,18 @@ pub fn run() {
             // Dev-only automation bridge (no-op in release builds).
             debug_bridge::start(app.handle().clone());
 
+            // WebKitGTK ships with WebRTC disabled; the mobile companion's
+            // peer-to-peer link needs RTCPeerConnection.
+            #[cfg(target_os = "linux")]
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.with_webview(|webview| {
+                    use webkit2gtk::{SettingsExt, WebViewExt};
+                    if let Some(settings) = webview.inner().settings() {
+                        settings.set_enable_webrtc(true);
+                    }
+                });
+            }
+
             let app_data_dir = app
                 .path()
                 .app_data_dir()
@@ -46,6 +59,7 @@ pub fn run() {
             app.manage(Mutex::new(init_result.connection));
             agent_status::start(app.handle(), &app_data_dir);
             app.manage(pty_manager::PtyManager::new());
+            app.manage(companion_lan::CompanionLan::default());
 
             // Initialize file watcher with the app handle for emitting events
             let file_watcher = file_ops::init_file_watcher(app.handle());
@@ -102,6 +116,10 @@ pub fn run() {
             file_ops::watch_file,
             file_ops::unwatch_file,
             file_ops::git_status,
+            companion_lan::companion_lan_start,
+            companion_lan::companion_lan_stop,
+            companion_lan::companion_lan_info,
+            companion_lan::companion_lan_send,
             agent_status::agent_status_snapshot,
             agent_status::agent_status_report,
             agent_status::agent_status_clear,

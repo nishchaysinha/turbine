@@ -130,7 +130,8 @@ async function launch() {
   );
   await waitFor(async () => (await fetch(`${BRIDGE}/ping`)).ok, 'debug bridge up', 60000);
   // Software GL under Xvfb paints stale WebGL frames; use the DOM renderer.
-  await ev("localStorage.setItem('turbine.terminalRenderer','dom'); location.reload(); return 1");
+  // The reload can tear down the page before the bridge answers; that's fine.
+  await ev("localStorage.setItem('turbine.terminalRenderer','dom'); setTimeout(() => location.reload(), 50); return 1").catch(() => {});
   await sleep(4000);
   await waitFor(() => ev('return Boolean(window.__turbine)'), 'app ready', 30000);
 }

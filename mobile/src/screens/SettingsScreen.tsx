@@ -43,7 +43,7 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ onDisconnect }) 
           <View style={[styles.statusPill, status !== 'connected' && styles.statusPillWarn]}>
             <View style={[styles.statusDot, status !== 'connected' && styles.statusDotWarn]} />
             <Text style={[styles.statusText, status !== 'connected' && styles.statusTextWarn]}>
-              {status === 'connected' ? 'Direct P2P (DTLS)' : 'Reconnecting…'}
+              {status !== 'connected' ? 'Reconnecting…' : socketService.lanTarget ? 'Local network' : 'Direct P2P (DTLS)'}
             </Text>
           </View>
         </View>
@@ -62,8 +62,10 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ onDisconnect }) 
           </Text>
         </View>
         <View style={styles.infoRow}>
-          <Text style={styles.infoLabel}>Pairing code:</Text>
-          <Text style={styles.infoValue}>{socketService.pairingCode}</Text>
+          <Text style={styles.infoLabel}>{socketService.lanTarget ? 'Address:' : 'Pairing code:'}</Text>
+          <Text style={styles.infoValue}>
+            {socketService.lanTarget ? socketService.lanTarget.url.replace(/^wss?:\/\//, '') : socketService.pairingCode}
+          </Text>
         </View>
         <View style={styles.infoRow}>
           <Text style={styles.infoLabel}>Signaling:</Text>

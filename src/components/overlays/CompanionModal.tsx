@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import QRCode from 'qrcode';
-import { p2pBridge } from '../../services/p2pBridge';
+import { p2pBridge, type LanInfo } from '../../services/p2pBridge';
 import type { RelayConnectionStatus, RelaySessionInfo, RelayPeerInfo } from '../../types/relay';
 import './CompanionModal.css';
 
@@ -20,6 +20,36 @@ export function CompanionModal({ isOpen, onClose }: CompanionModalProps) {
   const [isConnecting, setIsConnecting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [latency, setLatency] = useState<number | null>(p2pBridge.getLatency());
+  const [lan, setLan] = useState<LanInfo | null>(p2pBridge.getLanInfo());
+  const [lanQr, setLanQr] = useState<string | null>(null);
+  const [lanBusy, setLanBusy] = useState(false);
+  const webrtc = p2pBridge.webrtcAvailable();
+
+  useEffect(() => p2pBridge.onLanChange(setLan), []);
+
+  useEffect(() => {
+    if (!lan?.running || !lan.urls.length) {
+      setLanQr(null);
+      return;
+    }
+    const payload = JSON.stringify({ type: 'turbine-lan', url: lan.urls[0], urls: lan.urls, token: lan.token });
+    QRCode.toDataURL(payload, { width: 180, margin: 1, color: { dark: '#00e5c8', light: '#071320' } })
+      .then(setLanQr)
+      .catch(() => setLanQr(null));
+  }, [lan]);
+
+  const toggleLan = async () => {
+    setLanBusy(true);
+    setErrorMsg(null);
+    try {
+      if (lan?.running) await p2pBridge.stopLan();
+      else await p2pBridge.startLan();
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLanBusy(false);
+    }
+  };
 
   useEffect(() => {
     const unsubP2pStatus = p2pBridge.onStatusChange((status) => {
@@ -97,7 +127,7 @@ export function CompanionModal({ isOpen, onClose }: CompanionModalProps) {
             <span className="companion-icon">📱</span>
             <div>
               <h2>Mobile Companion</h2>
-              <span className="companion-badge">100% Pure WebRTC DataChannel (E2EE)</span>
+              <span className="companion-badge">{webrtc ? 'Direct P2P (WebRTC, encrypted) or local network' : 'Local network'}</span>
             </div>
           </div>
           <button className="companion-close-btn" onClick={onClose} aria-label="Close">
@@ -106,10 +136,13 @@ export function CompanionModal({ isOpen, onClose }: CompanionModalProps) {
         </div>
 
         <p className="companion-modal-subtitle">
-          Direct peer-to-peer pairing with your phone. No terminal output, code, or keystrokes ever touch a server.
+          {webrtc
+            ? 'Pair your phone directly. With P2P, terminal output and keystrokes never touch a server; on the same Wi-Fi you can also connect over the local network.'
+            : 'Pair your phone over your local network.'}
         </p>
 
-        {/* Signaling Configuration */}
+        {/* Signaling Configuration (WebRTC) */}
+        {webrtc && (
         <div className="companion-config-card">
           <label className="companion-label">Signaling Service (Vercel Serverless):</label>
           <div className="companion-input-group">
@@ -149,6 +182,7 @@ export function CompanionModal({ isOpen, onClose }: CompanionModalProps) {
             🔒 The server only relays the WebRTC handshake. The code stays valid for 24h, so your phone can reconnect with it.
           </p>
         </div>
+        )}
 
         {errorMsg && <div className="companion-error-banner">{errorMsg}</div>}
 
@@ -176,6 +210,54 @@ export function CompanionModal({ isOpen, onClose }: CompanionModalProps) {
           </div>
         )}
 
+        {!webrtc && (
+          <div className="companion-error-banner">
+            Peer-to-peer pairing needs WebRTC, which this system's web engine doesn't provide (WebKitGTK on Linux). Use
+            local network pairing below.
+          </div>
+        )}
+
+        {/* Direct LAN connection (Rust WebSocket server) */}
+        <div className="companion-config-card">
+          <label className="companion-label">Local network</label>
+          <div className="companion-input-group">
+            <span className="companion-hint" style={{ flex: 1, margin: 0 }}>
+              {lan?.running
+                ? `Listening on ${lan.urls.join('  ·  ')}${lan.clients ? ` — ${lan.clients} phone connected` : ''}`
+                : 'Let your phone connect directly over Wi-Fi (same network, no internet needed).'}
+            </span>
+            <button
+              className={lan?.running ? 'companion-btn-stop' : 'companion-btn-start'}
+              onClick={toggleLan}
+              disabled={lanBusy}
+            >
+              {lanBusy ? '…' : lan?.running ? 'Stop' : 'Enable'}
+            </button>
+          </div>
+          {lan?.running && (
+            <div className="companion-pairing-section">
+              <div className="companion-qr-container">
+                {lanQr ? <img src={lanQr} alt="LAN pairing QR Code" className="companion-qr-image" /> : null}
+                <span className="companion-qr-hint">Scan with Turbine Companion</span>
+              </div>
+              <div className="companion-code-container">
+                <span className="companion-code-label">Address</span>
+                <div className="companion-code-box">
+                  <span className="companion-code-text" style={{ fontSize: 14 }}>{lan.urls[0]?.replace('ws://', '')}</span>
+                </div>
+                <span className="companion-code-label">Token</span>
+                <div className="companion-code-box" title="Click to copy" onClick={() => navigator.clipboard.writeText(lan.token)}>
+                  <span className="companion-code-text" style={{ fontSize: 13, letterSpacing: 0 }}>{lan.token}</span>
+                </div>
+                <p className="companion-code-sub">
+                  ⚠️ Not encrypted — use on trusted networks only. Stopping and re-enabling keeps the same token; anyone with
+                  it on your network can control your terminals.
+                </p>
+              </div>
+            </div>
+          )}
+        </div>
+
         {/* Status / Peer Footer */}
         <div className="companion-footer">
           <div className="companion-status-row">
@@ -183,7 +265,7 @@ export function CompanionModal({ isOpen, onClose }: CompanionModalProps) {
               className={`companion-status-dot ${
                 p2pStatus === 'connected'
                   ? 'dot-connected'
-                  : p2pSession
+                  : p2pSession || lan?.running
                   ? 'dot-waiting'
                   : isConnecting
                   ? 'dot-connecting'
@@ -192,12 +274,14 @@ export function CompanionModal({ isOpen, onClose }: CompanionModalProps) {
             />
             <span className="companion-status-text">
               {p2pStatus === 'connected'
-                ? `🟢 P2P Direct (DTLS E2EE)${latency !== null ? ` • ⚡ ${latency}ms` : ''}`
-                : p2pSession
-                ? '🟡 Waiting for Phone Connection...'
+                ? `🟢 Connected${p2pPeers[0]?.deviceName ? ` · ${p2pPeers[0].deviceName}` : ''}${latency !== null ? ` • ⚡ ${latency}ms` : ''}`
+                : p2pSession || lan?.running
+                ? `🟡 Waiting for your phone${lan?.running ? ' (local network' + (p2pSession ? ' or P2P code)' : ')') : '…'}`
                 : isConnecting
-                ? '🔄 Registering SDP Offer...'
-                : '⚪ Offline — Click Start Pairing to begin'}
+                ? '🔄 Registering offer…'
+                : webrtc
+                ? '⚪ Offline — Start Pairing or enable Local network'
+                : '⚪ Offline — enable Local network to pair'}
             </span>
           </div>
 

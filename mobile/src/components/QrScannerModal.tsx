@@ -1,21 +1,28 @@
 import React, { useRef } from 'react';
 import { Modal, View, Text, TouchableOpacity, StyleSheet } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
-import { parsePairingPayload } from '../utils/pairing';
+import { parseLanPayload, parsePairingPayload, type LanTarget } from '../utils/pairing';
 
 interface QrScannerModalProps {
   visible: boolean;
   onClose: () => void;
   onScanned: (payload: { pairingCode: string; signalingUrl?: string }) => void;
+  onScannedLan?: (target: LanTarget) => void;
 }
 
 /** Scans the pairing QR shown in Turbine's Companion dialog. */
-export const QrScannerModal: React.FC<QrScannerModalProps> = ({ visible, onClose, onScanned }) => {
+export const QrScannerModal: React.FC<QrScannerModalProps> = ({ visible, onClose, onScanned, onScannedLan }) => {
   const [permission, requestPermission] = useCameraPermissions();
   const handled = useRef(false);
 
   const handleScan = ({ data }: { data: string }) => {
     if (handled.current) return;
+    const lan = parseLanPayload(data);
+    if (lan && onScannedLan) {
+      handled.current = true;
+      onScannedLan(lan);
+      return;
+    }
     const payload = parsePairingPayload(data);
     if (!payload) return;
     handled.current = true;

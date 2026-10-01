@@ -6,6 +6,8 @@ export interface SavedHost {
   signalingUrl: string;
   label: string;
   lastConnectedAt: number;
+  /** Present for LAN hosts: `signalingUrl` then holds the ws:// address. */
+  lanToken?: string;
 }
 
 const KEY = 'turbine.savedHosts.v1';

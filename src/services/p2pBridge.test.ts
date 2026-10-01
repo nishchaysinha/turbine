@@ -151,12 +151,13 @@ describe('path safety', () => {
 });
 
 describe('P2PBridge files and history', () => {
+  // Exactly what the Rust command returns (snake_case fields).
   const tree = [
-    { path: '/repo/README.md', relativePath: 'README.md', isDir: false },
-    { path: '/repo/src', relativePath: 'src', isDir: true },
-    { path: '/repo/src/server.ts', relativePath: 'src/server.ts', isDir: false },
-    { path: '/repo/src/lib', relativePath: 'src/lib', isDir: true },
-    { path: '/repo/src/lib/db.ts', relativePath: 'src/lib/db.ts', isDir: false },
+    { path: '/repo/README.md', relative_path: 'README.md', is_dir: false },
+    { path: '/repo/src', relative_path: 'src', is_dir: true },
+    { path: '/repo/src/server.ts', relative_path: 'src/server.ts', is_dir: false },
+    { path: '/repo/src/lib', relative_path: 'src/lib', is_dir: true },
+    { path: '/repo/src/lib/db.ts', relative_path: 'src/lib/db.ts', is_dir: false },
   ];
 
   beforeEach(() => {

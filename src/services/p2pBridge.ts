@@ -24,6 +24,16 @@ type SessionListener = (session: RelaySessionInfo | null) => void;
 export const DEFAULT_SIGNALING_URL = 'https://signaling-taupe.vercel.app';
 const SIGNALING_URL_KEY = 'turbine_signaling_url';
 const PAIRING_KEY = 'turbine_p2p_pairing';
+const LAN_ENABLED_KEY = 'turbine_lan_enabled';
+const LAN_TOKEN_KEY = 'turbine_lan_token';
+
+export interface LanInfo {
+  running: boolean;
+  port: number;
+  token: string;
+  urls: string[];
+  clients: number;
+}
 
 const ICE_GATHER_TIMEOUT_MS = 1500;
 const POLL_FAST_MS = 1500;
@@ -186,7 +196,110 @@ export class P2PBridge {
   }
 
   public isConnected(): boolean {
-    return this.status === 'connected' && this.dc?.readyState === 'open';
+    return this.status === 'connected' && (this.dc?.readyState === 'open' || this.lanClients.size > 0);
+  }
+
+  /** WebKitGTK (Linux) is built without WebRTC; LAN is the only transport there. */
+  public webrtcAvailable(): boolean {
+    return typeof RTCPeerConnection !== 'undefined';
+  }
+
+  // ── LAN transport (Rust WebSocket server, see src-tauri/src/companion_lan.rs) ──
+
+  private lanClients = new Set<number>();
+  private lanInfo: LanInfo | null = null;
+  private lanListeners = new Set<(info: LanInfo | null) => void>();
+  private lanInitDone = false;
+
+  public getLanInfo(): LanInfo | null {
+    return this.lanInfo;
+  }
+
+  public onLanChange(fn: (info: LanInfo | null) => void): () => void {
+    this.lanListeners.add(fn);
+    fn(this.lanInfo);
+    return () => this.lanListeners.delete(fn);
+  }
+
+  private setLanInfo(info: LanInfo | null) {
+    this.lanInfo = info;
+    this.lanListeners.forEach((fn) => fn(info));
+  }
+
+  /** Subscribes to LAN connection events and restores the server if it was enabled. */
+  public async initLan() {
+    if (this.lanInitDone) return;
+    this.lanInitDone = true;
+    const { listen } = await import('@tauri-apps/api/event');
+    await listen<{ connId: number }>('companion_lan_open', (e) => {
+      this.lanClients.add(e.payload.connId);
+      if (this.status !== 'connected') this.onPeerConnected('Phone (LAN)');
+      void this.refreshLan();
+    });
+    await listen<{ connId: number; data: string }>('companion_lan_message', (e) => {
+      if (this.lanClients.has(e.payload.connId) && typeof e.payload.data === 'string') void this.handleMessage(e.payload.data);
+    });
+    await listen<{ connId: number }>('companion_lan_close', (e) => {
+      this.lanClients.delete(e.payload.connId);
+      if (this.lanClients.size === 0 && this.dc?.readyState !== 'open') this.onPeerGone();
+      void this.refreshLan();
+    });
+    if (readStorage(LAN_ENABLED_KEY) === '1') {
+      await this.startLan().catch((err) => console.warn('[P2PBridge] LAN restore failed', err));
+    }
+  }
+
+  public async startLan(port?: number): Promise<LanInfo> {
+    const info = await invoke<LanInfo>('companion_lan_start', {
+      port: port ?? null,
+      token: readStorage(LAN_TOKEN_KEY),
+    });
+    writeStorage(LAN_ENABLED_KEY, '1');
+    writeStorage(LAN_TOKEN_KEY, info.token);
+    this.setLanInfo(info);
+    return info;
+  }
+
+  public async stopLan(forgetToken = false) {
+    this.setLanInfo(await invoke<LanInfo>('companion_lan_stop'));
+    writeStorage(LAN_ENABLED_KEY, null);
+    if (forgetToken) writeStorage(LAN_TOKEN_KEY, null);
+    this.lanClients.clear();
+    if (this.dc?.readyState !== 'open' && this.status === 'connected') this.onPeerGone();
+  }
+
+  private async refreshLan() {
+    try {
+      this.setLanInfo(await invoke<LanInfo>('companion_lan_info'));
+    } catch {}
+  }
+
+  /** Shared by both transports once a phone is talking to us. */
+  private onPeerConnected(deviceName: string) {
+    this.stopPollingAnswer();
+    this.setStatus('connected');
+    this.setPeers([{ role: 'mobile', deviceName, timestamp: Date.now() }]);
+    this.watchStores();
+    this.syncFullState();
+
+    if (this.pingTimer) clearInterval(this.pingTimer);
+    this.pingTimer = window.setInterval(() => {
+      this.send('ping', { clientTime: Date.now() });
+    }, 4000);
+    this.send('ping', { clientTime: Date.now() });
+  }
+
+  private onPeerGone() {
+    this.unwatchStores();
+    if (this.pingTimer) {
+      clearInterval(this.pingTimer);
+      this.pingTimer = null;
+    }
+    this.setPeers([]);
+    this.latencyMs = null;
+    this.peerCaps = new Set();
+    this.subscribedPanes = null;
+    this.setStatus(this.session ? 'connecting' : 'disconnected');
   }
 
   public setSignalingUrl(url: string) {
@@ -217,6 +330,8 @@ export class P2PBridge {
   }
 
   private setStatus(status: RelayConnectionStatus) {
+    // A phone on the LAN keeps us connected whatever the WebRTC side is doing.
+    if (this.lanClients?.size > 0 && status !== 'connected') status = 'connected';
     this.status = status;
     this.statusListeners.forEach((fn) => fn(status));
   }
@@ -241,6 +356,11 @@ export class P2PBridge {
     }
     if (options.fresh) {
       writeStorage(PAIRING_KEY, null);
+    }
+    if (!this.webrtcAvailable()) {
+      throw new Error(
+        'This system’s web engine has no WebRTC (WebKitGTK on Linux is built without it). Use “Local network” pairing below instead.',
+      );
     }
     this.teardownPeer();
     const gen = ++this.generation;
@@ -340,17 +460,7 @@ export class P2PBridge {
   private setupDataChannel(dc: RTCDataChannel, gen: number) {
     dc.onopen = () => {
       if (gen !== this.generation) return;
-      this.stopPollingAnswer();
-      this.setStatus('connected');
-      this.setPeers([{ role: 'mobile', deviceName: 'Direct Phone (P2P)', timestamp: Date.now() }]);
-      this.watchStores();
-      this.syncFullState();
-
-      if (this.pingTimer) clearInterval(this.pingTimer);
-      this.pingTimer = window.setInterval(() => {
-        this.send('ping', { clientTime: Date.now() });
-      }, 4000);
-      this.send('ping', { clientTime: Date.now() });
+      this.onPeerConnected('Direct Phone (P2P)');
     };
 
     dc.onmessage = (event) => {
@@ -432,10 +542,13 @@ export class P2PBridge {
   /** Close the peer connection but keep the session/pairing code. */
   private teardownPeer() {
     this.stopPollingAnswer();
-    this.unwatchStores();
-    if (this.pingTimer) {
-      clearInterval(this.pingTimer);
-      this.pingTimer = null;
+    const lanActive = this.lanClients?.size > 0;
+    if (!lanActive) {
+      this.unwatchStores();
+      if (this.pingTimer) {
+        clearInterval(this.pingTimer);
+        this.pingTimer = null;
+      }
     }
     if (this.dc) {
       const dc = this.dc;
@@ -450,6 +563,7 @@ export class P2PBridge {
       pc.onconnectionstatechange = null;
       try { pc.close(); } catch {}
     }
+    if (lanActive) return;
     if (this.peers.length > 0) this.setPeers([]);
     this.latencyMs = null;
     this.peerCaps = new Set();
@@ -470,8 +584,12 @@ export class P2PBridge {
   }
 
   public send(type: string, payload: unknown) {
+    const data = JSON.stringify({ type, payload, timestamp: Date.now() });
     if (this.dc && this.dc.readyState === 'open') {
-      this.dc.send(JSON.stringify({ type, payload, timestamp: Date.now() }));
+      this.dc.send(data);
+    }
+    if (this.lanClients.size > 0) {
+      invoke('companion_lan_send', { data }).catch(() => {});
     }
   }
 
@@ -748,7 +866,9 @@ export class P2PBridge {
   private async loadFileTree(root: string, refresh: boolean) {
     const cached = this.fileTreeCache.get(root);
     if (cached && !refresh && Date.now() - cached.at < FILE_TREE_TTL_MS) return cached;
-    const entries = await invoke<FileTreeEntry[]>('list_workspace_files', { root });
+    // The Rust struct serialises as snake_case (relative_path / is_dir).
+    const raw = await invoke<Array<{ path: string; relative_path: string; is_dir: boolean }>>('list_workspace_files', { root });
+    const entries: FileTreeEntry[] = raw.map((e) => ({ path: e.path, relativePath: e.relative_path, isDir: e.is_dir }));
     let statuses: Record<string, string> = {};
     try {
       statuses = await invoke<Record<string, string>>('git_status', { path: root });

@@ -195,6 +195,7 @@ function App() {
   useEffect(() => {
     void useAgentStatusStore.getState().init();
     void useSwarmStore.getState().initListeners();
+    void p2pBridge.initLan();
   }, []);
 
   useEffect(() => {

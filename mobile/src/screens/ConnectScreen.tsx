@@ -9,7 +9,7 @@ import {
   ActivityIndicator,
 } from 'react-native';
 import { socketService, DEFAULT_SIGNALING_URL } from '../services/socketService';
-import { normalizePairingCode, normalizeSignalingUrl, parsePairingPayload } from '../utils/pairing';
+import { normalizeLanUrl, normalizePairingCode, normalizeSignalingUrl, parseLanPayload, parsePairingPayload, type LanTarget } from '../utils/pairing';
 import { loadSavedHosts, rememberHost, forgetHost, type SavedHost } from '../services/savedHosts';
 import { QrScannerModal } from '../components/QrScannerModal';
 import { ConnectionLog } from '../components/ConnectionLog';
@@ -32,6 +32,9 @@ export const ConnectScreen: React.FC = () => {
   const [hosts, setHosts] = useState<SavedHost[]>([]);
   const [scanning, setScanning] = useState(false);
   const [showLog, setShowLog] = useState(false);
+  const [showLan, setShowLan] = useState(false);
+  const [lanUrl, setLanUrl] = useState(socketService.lanTarget?.url ?? '');
+  const [lanToken, setLanToken] = useState(socketService.lanTarget?.token ?? '');
 
   useEffect(() => {
     let alive = true;
@@ -49,7 +52,44 @@ export const ConnectScreen: React.FC = () => {
     };
   }, []);
 
+  const handleLanConnect = async (target?: LanTarget) => {
+    const t = target ?? { url: lanUrl, token: lanToken };
+    const url = normalizeLanUrl(t.url);
+    if (!url || !t.token.trim()) {
+      setError('Enter the address and token from Turbine → Companion → Local network.');
+      return;
+    }
+    setLanUrl(url);
+    setLanToken(t.token.trim());
+    setLoading(true);
+    setError(null);
+    try {
+      await socketService.connectLan({ url, token: t.token });
+      rememberHost({
+        pairingCode: 'LAN',
+        signalingUrl: url,
+        lanToken: t.token.trim(),
+        label: 'Local network',
+        lastConnectedAt: Date.now(),
+      }).catch(() => {});
+      try {
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      } catch {}
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : 'LAN connection failed');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleCodeChange = (text: string) => {
+    const lan = parseLanPayload(text);
+    if (lan) {
+      setShowLan(true);
+      setLanUrl(lan.url);
+      setLanToken(lan.token);
+      return;
+    }
     // Allow pasting the QR payload JSON as well as a bare code.
     const payload = parsePairingPayload(text);
     if (payload) {
@@ -179,6 +219,53 @@ export const ConnectScreen: React.FC = () => {
         </TouchableOpacity>
       </View>
 
+      <TouchableOpacity style={styles.logToggle} onPress={() => setShowLan((v) => !v)}>
+        <Text style={styles.logToggleText}>{showLan ? '▾' : '▸'} Connect over local network</Text>
+      </TouchableOpacity>
+      {showLan && (
+        <View style={styles.card}>
+          <Text style={styles.cardTitle}>Local network</Text>
+          <Text style={styles.cardSub}>
+            In Turbine, open 📱 Companion → Local network → Enable, then scan its QR or type the address and token. Same
+            Wi-Fi only; not encrypted.
+          </Text>
+          <View style={styles.inputGroup}>
+            <Text style={styles.label}>Address</Text>
+            <TextInput
+              style={styles.urlInput}
+              value={lanUrl}
+              onChangeText={setLanUrl}
+              placeholder="192.168.1.20:6970"
+              placeholderTextColor="#4a657e"
+              autoCapitalize="none"
+              autoCorrect={false}
+              editable={!loading}
+            />
+          </View>
+          <View style={styles.inputGroup}>
+            <Text style={styles.label}>Token</Text>
+            <TextInput
+              style={styles.urlInput}
+              value={lanToken}
+              onChangeText={setLanToken}
+              placeholder="32-character token"
+              placeholderTextColor="#4a657e"
+              autoCapitalize="none"
+              autoCorrect={false}
+              editable={!loading}
+            />
+          </View>
+          <TouchableOpacity
+            style={[styles.button, loading && styles.buttonDisabled]}
+            onPress={() => handleLanConnect()}
+            disabled={loading}
+            accessibilityLabel="Connect over LAN"
+          >
+            <Text style={styles.buttonText}>Connect over LAN</Text>
+          </TouchableOpacity>
+        </View>
+      )}
+
       {hosts.length > 0 && (
         <View style={styles.card}>
           <Text style={styles.cardTitle}>Recent desktops</Text>
@@ -188,11 +275,15 @@ export const ConnectScreen: React.FC = () => {
                 style={styles.hostInfo}
                 disabled={loading}
                 onPress={() => {
+                  if (h.lanToken) {
+                    handleLanConnect({ url: h.signalingUrl, token: h.lanToken });
+                    return;
+                  }
                   setPairingCode(h.pairingCode);
                   handleConnect({ pairingCode: h.pairingCode, signalingUrl: h.signalingUrl });
                 }}
               >
-                <Text style={styles.hostCode}>{h.pairingCode}</Text>
+                <Text style={styles.hostCode}>{h.lanToken ? `LAN · ${h.signalingUrl.replace(/^wss?:\/\//, '')}` : h.pairingCode}</Text>
                 <Text style={styles.hostMeta} numberOfLines={1}>
                   {h.label} · {timeAgo(h.lastConnectedAt)} · {h.signalingUrl.replace(/^https?:\/\//, '')}
                 </Text>
@@ -225,6 +316,11 @@ export const ConnectScreen: React.FC = () => {
           setScanning(false);
           setPairingCode(payload.pairingCode);
           handleConnect(payload);
+        }}
+        onScannedLan={(target) => {
+          setScanning(false);
+          setShowLan(true);
+          handleLanConnect(target);
         }}
       />
 

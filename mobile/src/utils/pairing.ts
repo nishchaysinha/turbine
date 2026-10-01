@@ -24,3 +24,30 @@ export function parsePairingPayload(text: string): { signalingUrl?: string; pair
   } catch {}
   return null;
 }
+
+export interface LanTarget {
+  url: string;
+  token: string;
+}
+
+/**
+ * LAN pairing: the desktop QR `{ type: 'turbine-lan', url, token }`, or a typed
+ * address like `192.168.1.5:6970` / `ws://host:port` plus a separate token.
+ */
+export function parseLanPayload(text: string): LanTarget | null {
+  try {
+    const data = JSON.parse(text);
+    if (data && data.type === 'turbine-lan' && typeof data.url === 'string' && typeof data.token === 'string') {
+      return { url: normalizeLanUrl(data.url), token: data.token };
+    }
+  } catch {}
+  return null;
+}
+
+export function normalizeLanUrl(input: string): string {
+  let url = input.trim().replace(/\/+$/, '');
+  if (!url) return '';
+  if (!/^wss?:\/\//i.test(url)) url = `ws://${url.replace(/^https?:\/\//i, '')}`;
+  if (!/:\d+$/.test(url)) url = `${url}:6970`;
+  return url;
+}

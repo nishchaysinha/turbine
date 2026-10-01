@@ -4,6 +4,7 @@ import { useTaskStore } from '../state/taskStore';
 import { useSwarmStore } from '../state/swarmStore';
 import { useAgentStore } from '../state/agentStore';
 import type { RelayConnectionStatus, RelaySessionInfo, RelayPeerInfo } from '../types/relay';
+import { onPtyOutput } from '../utils/ptyData';
 
 type StatusListener = (status: RelayConnectionStatus) => void;
 type PeerListener = (peers: RelayPeerInfo[]) => void;
@@ -837,3 +838,7 @@ export class P2PBridge {
 }
 
 export const p2pBridge = new P2PBridge();
+
+// Every pane's output (including swarm agents with no visible pane) reaches the
+// phone through the shared tap rather than from individual views.
+onPtyOutput((paneId, _bytes, text) => p2pBridge.sendTerminalOutput(paneId, text));

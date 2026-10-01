@@ -32,6 +32,7 @@ import { BroadcastOverlay } from './components/terminal/BroadcastOverlay';
 import { ShortcutSheet } from './components/overlays/ShortcutSheet';
 import { CompanionModal } from './components/overlays/CompanionModal';
 import { p2pBridge } from './services/p2pBridge';
+import { useAgentStatusStore, withExitMarker } from './state/agentStatusStore';
 import './App.css';
 
 function replaceLeafPaneId(node: import('./types').LayoutNode, fromId: string, toId: string): import('./types').LayoutNode {
@@ -179,6 +180,13 @@ function App() {
   useEffect(() => {
     p2pBridge.setActivePaneId(focusedPaneId);
   }, [focusedPaneId]);
+
+  // The status hub and swarm listeners must run from launch, not only once
+  // the Swarm panel is opened, or agents started elsewhere never complete.
+  useEffect(() => {
+    void useAgentStatusStore.getState().init();
+    void useSwarmStore.getState().initListeners();
+  }, []);
 
   useEffect(() => {
     p2pBridge.syncState();
@@ -451,7 +459,7 @@ function App() {
       pane.id = item.agent.pane_id;
       pane.type = 'terminal';
       pane.workingDirectory = item.projectPath;
-      pane.startupCommand = item.agent.command;
+      pane.startupCommand = withExitMarker(item.agent.command);
       pane.autoLaunch = true;
       pane.label = item.agent.role;
 

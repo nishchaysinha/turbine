@@ -13,14 +13,7 @@ use crate::types::{SwarmAgent, WorkflowStep};
 
 type DbState = Mutex<Connection>;
 
-/// Resolve template variables in a CLI command template.
-fn resolve_template(template: &str, vars: &HashMap<&str, &str>) -> String {
-    let mut result = template.to_string();
-    for (key, value) in vars {
-        result = result.replace(&format!("{{{{{}}}}}", key), value);
-    }
-    result
-}
+use crate::agent_command::resolve_template;
 
 /// Find workflow steps that are ready to execute:
 /// - status == "pending"

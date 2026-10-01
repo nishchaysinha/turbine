@@ -3,7 +3,8 @@ import { invoke } from '@tauri-apps/api/core';
 import { type UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import type { SwarmRun, SwarmAgent, MailboxMessage, SwarmStatus, WorkflowStep, Task } from '../types';
-import { drainPtyOutput } from '../utils/ptyData';
+import { drainPtyOutput, isPaneOutputClaimed, onPtyOutput } from '../utils/ptyData';
+import { useAgentStatusStore } from './agentStatusStore';
 
 const OUTPUT_BUFFER_MAX = 10 * 1024; // 10KB rolling buffer per agent
 let listenerInitPromise: Promise<void> | null = null;
@@ -73,10 +74,102 @@ export const useSwarmStore = create<SwarmState>((set, get) => {
       return { outputBuffers: next };
     });
   };
-  const drainSwarmOutput = (pane_id: string) =>
-    drainPtyOutput(pane_id, (bytes) => {
-      appendSwarmOutput(pane_id, new TextDecoder().decode(bytes));
-    });
+  // Agent output reaches outputBuffers through the tap below. We only drain
+  // when no TerminalPane is showing the agent (it owns the read otherwise),
+  // so the PTY never blocks on a full buffer.
+  const drainSwarmOutput = (pane_id: string) => {
+    if (isPaneOutputClaimed(pane_id)) return;
+    return drainPtyOutput(pane_id, () => {});
+  };
+
+  /** Marks a swarm agent finished (from a PTY exit or an exit marker) and advances its run. */
+  const completeAgentExit = (pane_id: string, exit_code: number | null) => {
+    const state = get();
+    // Find which agent this belongs to
+    for (const [runId, agentList] of state.agents) {
+      const agent = agentList.find((a) => a.pane_id === pane_id);
+      if (!agent) continue;
+      if (agent.status !== 'running' && agent.status !== 'pending') break;
+
+      const exitKey = `${runId}:${agent.id}`;
+      if (processedAgentExits.has(exitKey)) break;
+      processedAgentExits.add(exitKey);
+
+      const newStatus = (exit_code === 0 || exit_code === null) ? 'completed' : 'failed';
+      const rawOutput = state.outputBuffers.get(pane_id) ?? '';
+      const outputSummary = rawOutput ? stripAnsi(rawOutput).slice(-4096) : null;
+
+      const updatedAgent: SwarmAgent = {
+        ...agent,
+        status: newStatus,
+        exit_code: exit_code,
+        output_summary: outputSummary,
+        completed_at: new Date().toISOString(),
+      };
+
+      // Persist agent update
+      void invoke('save_swarm_agent', { agent: updatedAgent });
+
+      // Update agents in store
+      set((s) => {
+        const nextAgents = new Map(s.agents);
+        const list = nextAgents.get(runId) ?? [];
+        nextAgents.set(runId, list.map((a) => (a.id === agent.id ? updatedAgent : a)));
+        return { agents: nextAgents };
+      });
+
+      // Post a mailbox message about completion
+      const statusLabel = newStatus === 'completed' ? 'completed successfully' : `failed (exit code: ${exit_code})`;
+      void get().postMessage(runId, agent.role, `Agent ${statusLabel}.${outputSummary ? `\n\nOutput (last 500 chars):\n${outputSummary.slice(-500)}` : ''}`);
+
+      // Try to advance workflow (spawns next steps if any are ready)
+      const runSteps = get().workflowSteps.get(runId) ?? [];
+      if (runSteps.length > 0) {
+        // Workflow run — use engine to advance
+        void invoke<SwarmAgent[]>('swarm_advance_run', {
+          runId,
+          completedAgentPaneId: pane_id,
+          exitCode: exit_code,
+          outputSummary: outputSummary,
+        }).then((newAgents) => {
+          if (newAgents.length > 0) {
+            set((s) => {
+              const nextAgents = new Map(s.agents);
+              const list = nextAgents.get(runId) ?? [];
+              nextAgents.set(runId, [...list, ...newAgents]);
+              const workspaceId = s.runWorkspaceIds.get(runId);
+              const sourcePaneId = s.runSourcePaneIds.get(runId) ?? null;
+              const projectPath = s.runs.find((r) => r.id === runId)?.project_path;
+              const pendingAgentPanes = workspaceId && projectPath
+                ? [
+                    ...s.pendingAgentPanes,
+                    ...newAgents.map((agent) => ({ agent, workspaceId, sourcePaneId, projectPath })),
+                  ]
+                : s.pendingAgentPanes;
+              return { agents: nextAgents, pendingAgentPanes };
+            });
+          }
+          // Reload run state to get updated status
+          void get().loadAgents(runId);
+          void get().loadWorkflowSteps(runId);
+          const projectPath = get().runs.find((r) => r.id === runId)?.project_path;
+          if (projectPath) {
+            void get().loadRuns(projectPath);
+          }
+        }).catch((e) => console.error('Failed to advance workflow', e));
+      } else {
+        // Non-workflow run — check if all agents done
+        const updatedList = (get().agents.get(runId) ?? []);
+        const allDone = updatedList.every((a) => a.status === 'completed' || a.status === 'failed' || a.status === 'cancelled');
+        if (allDone) {
+          const anyFailed = updatedList.some((a) => a.status === 'failed');
+          void get().updateRunStatus(runId, anyFailed ? 'Failed' : 'Completed', null);
+        }
+      }
+
+      break;
+    }
+  };
 
   return {
   runs: [],
@@ -100,6 +193,12 @@ export const useSwarmStore = create<SwarmState>((set, get) => {
     listenerInitPromise = (async () => {
       const unlisteners: UnlistenFn[] = [];
 
+      unlisteners.push(
+        onPtyOutput((paneId, _bytes, text) => {
+          if (paneId.startsWith('swarm-')) appendSwarmOutput(paneId, text);
+        }),
+      );
+
       // Listen for PTY output from swarm agents
       const appWindow = getCurrentWebviewWindow();
       const unlisten1 = await appWindow.listen<{ pane_id: string }>('pty_data_ready', (event) => {
@@ -112,95 +211,23 @@ export const useSwarmStore = create<SwarmState>((set, get) => {
       // Listen for PTY exit events from swarm agents
       const unlisten2 = await appWindow.listen<{ pane_id: string; exit_code: number | null }>('pty_exit', (event) => {
         const { pane_id, exit_code } = event.payload;
-        if (!pane_id.startsWith('swarm-')) return;
-
-        const state = get();
-        // Find which agent this belongs to
-        for (const [runId, agentList] of state.agents) {
-          const agent = agentList.find((a) => a.pane_id === pane_id);
-          if (!agent) continue;
-          if (agent.status !== 'running' && agent.status !== 'pending') break;
-
-          const exitKey = `${runId}:${agent.id}`;
-          if (processedAgentExits.has(exitKey)) break;
-          processedAgentExits.add(exitKey);
-
-          const newStatus = (exit_code === 0 || exit_code === null) ? 'completed' : 'failed';
-          const rawOutput = state.outputBuffers.get(pane_id) ?? '';
-          const outputSummary = rawOutput ? stripAnsi(rawOutput).slice(-4096) : null;
-
-          const updatedAgent: SwarmAgent = {
-            ...agent,
-            status: newStatus,
-            exit_code: exit_code,
-            output_summary: outputSummary,
-            completed_at: new Date().toISOString(),
-          };
-
-          // Persist agent update
-          void invoke('save_swarm_agent', { agent: updatedAgent });
-
-          // Update agents in store
-          set((s) => {
-            const nextAgents = new Map(s.agents);
-            const list = nextAgents.get(runId) ?? [];
-            nextAgents.set(runId, list.map((a) => (a.id === agent.id ? updatedAgent : a)));
-            return { agents: nextAgents };
-          });
-
-          // Post a mailbox message about completion
-          const statusLabel = newStatus === 'completed' ? 'completed successfully' : `failed (exit code: ${exit_code})`;
-          void get().postMessage(runId, agent.role, `Agent ${statusLabel}.${outputSummary ? `\n\nOutput (last 500 chars):\n${outputSummary.slice(-500)}` : ''}`);
-
-          // Try to advance workflow (spawns next steps if any are ready)
-          const runSteps = get().workflowSteps.get(runId) ?? [];
-          if (runSteps.length > 0) {
-            // Workflow run — use engine to advance
-            void invoke<SwarmAgent[]>('swarm_advance_run', {
-              runId,
-              completedAgentPaneId: pane_id,
-              exitCode: exit_code,
-              outputSummary: outputSummary,
-            }).then((newAgents) => {
-              if (newAgents.length > 0) {
-                set((s) => {
-                  const nextAgents = new Map(s.agents);
-                  const list = nextAgents.get(runId) ?? [];
-                  nextAgents.set(runId, [...list, ...newAgents]);
-                  const workspaceId = s.runWorkspaceIds.get(runId);
-                  const sourcePaneId = s.runSourcePaneIds.get(runId) ?? null;
-                  const projectPath = s.runs.find((r) => r.id === runId)?.project_path;
-                  const pendingAgentPanes = workspaceId && projectPath
-                    ? [
-                        ...s.pendingAgentPanes,
-                        ...newAgents.map((agent) => ({ agent, workspaceId, sourcePaneId, projectPath })),
-                      ]
-                    : s.pendingAgentPanes;
-                  return { agents: nextAgents, pendingAgentPanes };
-                });
-              }
-              // Reload run state to get updated status
-              void get().loadAgents(runId);
-              void get().loadWorkflowSteps(runId);
-              const projectPath = get().runs.find((r) => r.id === runId)?.project_path;
-              if (projectPath) {
-                void get().loadRuns(projectPath);
-              }
-            }).catch((e) => console.error('Failed to advance workflow', e));
-          } else {
-            // Non-workflow run — check if all agents done
-            const updatedList = (get().agents.get(runId) ?? []);
-            const allDone = updatedList.every((a) => a.status === 'completed' || a.status === 'failed' || a.status === 'cancelled');
-            if (allDone) {
-              const anyFailed = updatedList.some((a) => a.status === 'failed');
-              void get().updateRunStatus(runId, anyFailed ? 'Failed' : 'Completed', null);
-            }
-          }
-
-          break;
-        }
+        if (pane_id.startsWith('swarm-')) completeAgentExit(pane_id, exit_code);
       });
       unlisteners.push(unlisten2);
+
+      // Agents run inside an interactive shell, so the PTY outlives them. The
+      // exit marker appended to their command reports the real exit through
+      // the agent status hub.
+      unlisteners.push(
+        useAgentStatusStore.subscribe((st, prev) => {
+          for (const [paneId, row] of Object.entries(st.rows)) {
+            if (!paneId.startsWith('swarm-') || row === prev.rows[paneId]) continue;
+            if (row.state === 'done' && row.exitCode !== null && row.exitCode !== undefined) {
+              completeAgentExit(paneId, row.exitCode);
+            }
+          }
+        }),
+      );
 
       set({ _unlisteners: unlisteners });
     })();

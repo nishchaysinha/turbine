@@ -254,6 +254,13 @@ pub fn spawn_pty_internal(
     // Set COLORTERM so programs can detect true-color support
     cmd.env("COLORTERM", "truecolor");
 
+    // Agent hooks find the status hub and identify their pane through these.
+    if let Some(hub) = app_handle.try_state::<std::sync::Arc<crate::agent_status::AgentStatusHub>>() {
+        for (k, v) in hub.pty_env(&pane_id) {
+            cmd.env(k, v);
+        }
+    }
+
     // When launched from Finder/Launchpad (production builds), macOS gives the
     // process a minimal PATH (/usr/bin:/bin:/usr/sbin:/sbin). This means tools
     // installed via Homebrew, nvm, cargo, go, etc. are not found.
@@ -373,6 +380,9 @@ pub fn spawn_pty_internal(
                         );
                     }
                     let exit_code = harvest_exit_code(&handle, &reader_pane_id);
+                    if let Some(hub) = handle.try_state::<std::sync::Arc<crate::agent_status::AgentStatusHub>>() {
+                        hub.clear(&reader_pane_id);
+                    }
                     let _ = handle.emit_to(
                         "main",
                         "pty_exit",

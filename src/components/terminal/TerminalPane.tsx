@@ -21,7 +21,7 @@ import { useWorkspaceStore } from '../../state/workspaceStore';
 import { p2pBridge } from '../../services/p2pBridge';
 import { useSearchStore } from '../../state/searchStore';
 import { spawnPaneSession } from '../../state/terminalSession';
-import { drainPtyOutput } from '../../utils/ptyData';
+import { claimPaneOutput, drainPtyOutput } from '../../utils/ptyData';
 import '@xterm/xterm/css/xterm.css';
 import './TerminalPane.css';
 
@@ -35,12 +35,29 @@ interface CachedTerminal {
   searchAddon: SearchAddon;
 }
 const terminalCache = new Map<string, CachedTerminal>();
+if (import.meta.env.DEV) {
+  // Lets the dev debug bridge read terminal buffers (see main.tsx).
+  (window as Window & { __turbineTerminals?: unknown }).__turbineTerminals = terminalCache;
+}
 
 // macOS 26.5's WKWebView garbles xterm's WebGL glyph atlas (xtermjs/xterm.js#5816).
 // Gate the WebGL renderer off there and let the DOM renderer take over until the
 // upstream fix ships. Resolved once at module load; terminals created before the
 // version arrives skip WebGL for that first frame only.
 let webglBroken = false;
+
+/**
+ * Escape hatch for GPUs/drivers where xterm's WebGL renderer paints stale
+ * frames (seen on software GL under Linux). Toggled from Settings or with
+ * `localStorage.setItem('turbine.terminalRenderer', 'dom')`.
+ */
+export function gpuRenderingEnabled(): boolean {
+  try {
+    return localStorage.getItem('turbine.terminalRenderer') !== 'dom';
+  } catch {
+    return true;
+  }
+}
 const webglGateReady = invoke<string | null>('get_macos_version')
   .then((v) => {
     if (!v) return;
@@ -282,7 +299,7 @@ function TerminalPaneInner({
       // Try WebGL addon, fall back silently to the DOM renderer.
       const capturedTerminal = terminal;
       webglGateReady.then(() => {
-        if (webglBroken) return;
+        if (webglBroken || !gpuRenderingEnabled()) return;
         // Re-attach on every context loss, not just the first — each new addon
         // needs its own handler or the second loss leaves a dead renderer.
         const attachWebgl = () => {
@@ -377,22 +394,22 @@ function TerminalPaneInner({
     let lineBuffer = '';
     let unlisten: UnlistenFn | null = null;
     let disposed = false;
+    // This view is the pane's only reader while mounted; others use output taps.
+    const releaseOutput = claimPaneOutput(paneId);
     const appWindow = getCurrentWebviewWindow();
     const drainOutput = () =>
-      drainPtyOutput(paneId, (bytes) => {
+      drainPtyOutput(paneId, (bytes, text) => {
         if (disposed) return;
         // Wait for xterm to finish parsing before the next pull — gates the
         // drain to the terminal's own throughput.
         return new Promise<void>((resolve) => {
-          handleOutput(bytes, resolve);
+          handleOutput(bytes, text, resolve);
         });
       });
-    const handleOutput = (bytes: Uint8Array, onParsed: () => void) => {
+    const handleOutput = (bytes: Uint8Array, text: string, onParsed: () => void) => {
       terminal.write(bytes, onParsed);
 
       // Scan output for media URLs (line-buffered)
-      const text = new TextDecoder().decode(bytes);
-      p2pBridge.sendTerminalOutput(paneId, text);
       appendOutput(text);
       lineBuffer += text;
       const lines = lineBuffer.split('\n');
@@ -599,6 +616,7 @@ function TerminalPaneInner({
       window.removeEventListener('focus', clearAtlas);
       dprQuery.removeEventListener('change', onDprChange);
       unlisten?.();
+      releaseOutput();
 
       // Only fully tear down if the pane was actually removed from the workspace.
       // During splits, the layout tree restructures and React unmounts/remounts the

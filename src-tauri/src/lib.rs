@@ -1,3 +1,5 @@
+pub mod agent_command;
+pub mod agent_status;
 pub mod commands;
 pub mod db;
 pub mod debug_bridge;
@@ -41,6 +43,7 @@ pub fn run() {
             }
 
             app.manage(Mutex::new(init_result.connection));
+            agent_status::start(app.handle(), &app_data_dir);
             app.manage(pty_manager::PtyManager::new());
 
             // Initialize file watcher with the app handle for emitting events
@@ -97,6 +100,11 @@ pub fn run() {
             file_ops::watch_file,
             file_ops::unwatch_file,
             file_ops::git_status,
+            agent_status::agent_status_snapshot,
+            agent_status::agent_status_report,
+            agent_status::agent_status_clear,
+            agent_status::agent_hooks_info,
+            agent_status::agent_hooks_set_claude,
             updater::check_for_updates,
             updater::install_update,
         ])

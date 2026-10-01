@@ -610,14 +610,7 @@ pub fn load_mailbox_messages(db: State<'_, DbState>, swarm_run_id: String) -> Re
 
 // ── Swarm Agent Commands ──────────────────────────────────────────────
 
-/// Resolve template variables in a CLI command template.
-fn resolve_template(template: &str, vars: &std::collections::HashMap<&str, &str>) -> String {
-    let mut result = template.to_string();
-    for (key, value) in vars {
-        result = result.replace(&format!("{{{{{}}}}}", key), value);
-    }
-    result
-}
+use crate::agent_command::resolve_template;
 
 fn build_agent_pane_id(run_id: &str, role: &str, suffix: &str) -> String {
     format!(

@@ -879,7 +879,12 @@ export class P2PBridge {
   private async gitDiff(requested: unknown) {
     const projectPath = this.resolveProjectPath(requested);
     try {
-      return { projectPath, diff: await invoke<string>('get_git_diff', { path: projectPath }) };
+      // Same scope as the desktop review's default: staged + unstaged + new files.
+      const review = await invoke<{ diff: string; branch: string | null; truncated: boolean }>('get_git_review', {
+        path: projectPath,
+        scope: 'all',
+      });
+      return { projectPath, diff: review.diff, branch: review.branch, truncated: review.truncated };
     } catch (e) {
       return { projectPath, diff: '', error: String(e) };
     }

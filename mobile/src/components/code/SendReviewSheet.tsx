@@ -91,12 +91,15 @@ export const SendReviewSheet: React.FC<{ visible: boolean; notes: ReviewNote[]; 
             <TouchableOpacity
               style={c.sheetOption}
               onPress={() => {
-                socketService.sendPromptToPane(focusedPane, prompt);
-                done('Sent review to focused terminal');
+                // No Enter: if no agent is running there, a shell would execute each line.
+                socketService.sendPromptToPane(focusedPane, prompt, !!socketService.agentStatus[focusedPane]);
+                done('Pasted review into focused terminal');
               }}
             >
               <Text style={c.sheetOptionTitle}>⌨ {focusedTitle?.title || focusedTitle?.label || 'Focused terminal'}</Text>
-              <Text style={c.sheetOptionSub}>Paste into the terminal you last opened</Text>
+              <Text style={c.sheetOptionSub}>
+                {socketService.agentStatus[focusedPane] ? 'Send to the agent in the terminal you last opened' : 'Paste (without Enter) into the terminal you last opened'}
+              </Text>
             </TouchableOpacity>
           )}
 

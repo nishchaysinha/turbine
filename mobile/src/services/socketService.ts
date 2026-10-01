@@ -565,8 +565,8 @@ export class SocketService {
   }
 
   /** Sends a (possibly multi-line) prompt to an agent terminal as a single pasted message. */
-  public sendPromptToPane(paneId: string, prompt: string) {
-    this.sendTerminalInput(paneId, bracketedPaste(prompt));
+  public sendPromptToPane(paneId: string, prompt: string, submit = true) {
+    this.sendTerminalInput(paneId, bracketedPaste(prompt, submit));
   }
 
   public requestDirectory(path: string, refresh = false) {

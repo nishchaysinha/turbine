@@ -4,6 +4,7 @@ pub mod commands;
 pub mod db;
 pub mod debug_bridge;
 pub mod file_ops;
+pub mod git_review;
 pub mod pty_manager;
 pub mod swarm_engine;
 pub mod types;
@@ -65,6 +66,7 @@ pub fn run() {
             commands::load_agent_presets,
             commands::delete_agent_preset,
             commands::get_git_diff,
+            git_review::get_git_review,
             commands::save_swarm_run,
             commands::load_swarm_runs,
             commands::delete_swarm_run,

@@ -57,9 +57,9 @@ describe('P2PBridge protocol', () => {
 
   it('requests git diff with the command argument name and resolved path', async () => {
     const { receive, sent } = connectedBridge();
-    invokeMock.mockResolvedValueOnce('diff --git a b');
+    invokeMock.mockResolvedValueOnce({ diff: 'diff --git a b', branch: 'main', truncated: false });
     await receive('diff:request', { projectPath: '.' });
-    expect(invokeMock).toHaveBeenCalledWith('get_git_diff', { path: '/repo' });
+    expect(invokeMock).toHaveBeenCalledWith('get_git_review', { path: '/repo', scope: 'all' });
     expect(last(sent)).toMatchObject({ type: 'diff:data', payload: { projectPath: '/repo', diff: 'diff --git a b' } });
   });
 
@@ -287,8 +287,8 @@ describe('P2PBridge protocol v2 (rpc)', () => {
 
   it('answers diff.get and state.get with results', async () => {
     const { receive, sent } = connectedBridge();
-    invokeMock.mockResolvedValueOnce('diff --git a b');
-    expect(await rpc(receive, sent, 'diff.get', {})).toMatchObject({ ok: true, result: { projectPath: '/repo', diff: 'diff --git a b' } });
+    invokeMock.mockResolvedValueOnce({ diff: 'diff --git a b', branch: 'main', truncated: false });
+    expect(await rpc(receive, sent, 'diff.get', {})).toMatchObject({ ok: true, result: { projectPath: '/repo', diff: 'diff --git a b', branch: 'main' } });
     const state = await rpc(receive, sent, 'state.get');
     expect(state.result.workspaces).toHaveLength(1);
     expect(Array.isArray(state.result.agentStatus)).toBe(true);

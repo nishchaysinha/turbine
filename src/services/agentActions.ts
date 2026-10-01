@@ -19,6 +19,11 @@ export function bracketedPaste(text: string, submit = true): string {
 export const agentActions = {
   sendPrompt: (paneId: string, prompt: string) =>
     write(paneId, prompt.includes('\n') ? bracketedPaste(prompt) : `${prompt}\r`),
+  /**
+   * Pastes without pressing Enter. Used for terminals with no agent reporting
+   * status: Enter there would run every line of the prompt as a shell command.
+   */
+  pasteOnly: (paneId: string, text: string) => write(paneId, bracketedPaste(text, false)),
   /** Accept the default choice of a permission prompt (Enter). */
   approve: (paneId: string) => write(paneId, '\r'),
   /** Dismiss a permission prompt / interrupt the current turn (Esc). */

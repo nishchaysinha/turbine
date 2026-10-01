@@ -12,6 +12,8 @@ import {
   restartSource,
   getSyntheticPaneId,
   fromRustLogSource,
+  generateCommand,
+  cleanLogLine,
   type RustLogSourceConfig,
 } from '../../../utils/logStreamManager';
 import { LogToolbar } from './LogToolbar';
@@ -41,6 +43,7 @@ const MAX_RENDERED_ENTRIES = 5_000;
 const MAX_ENTRIES_PER_FLUSH = 2_000;
 
 interface PendingChunk {
+  command: string;
   sourceId: string;
   sourceLabel: string;
   sourceColor: string;
@@ -113,7 +116,10 @@ export function LogDashboardPane({ paneId, workspaceId, onFocus }: LogDashboardP
   // store commits happen on a timer so a flood of events stays cheap per event.
   useEffect(() => {
     const appWindow = getCurrentWebviewWindow();
-    const decoder = new TextDecoder();
+    // Per source: a streaming decoder and the trailing partial line, so a line
+    // (or a UTF-8 character) cut by a drain boundary isn't split in two.
+    const decoders = new Map<number, TextDecoder>();
+    const partial = new Map<number, string>();
     let pending: PendingChunk[] = [];
     let pendingChars = 0;
     let flushTimer: number | null = null;
@@ -127,9 +133,9 @@ export function LogDashboardPane({ paneId, workspaceId, onFocus }: LogDashboardP
 
       const lines: { line: string; chunk: PendingChunk }[] = [];
       for (const chunk of chunks) {
-        for (const line of chunk.text.split('\n')) {
-          if (line.trim().length === 0) continue;
-          lines.push({ line, chunk });
+        for (const raw of chunk.text.split('\n')) {
+          const line = cleanLogLine(raw, chunk.command);
+          if (line) lines.push({ line, chunk });
         }
       }
 
@@ -153,10 +159,18 @@ export function LogDashboardPane({ paneId, workspaceId, onFocus }: LogDashboardP
               ? bytes.subarray(bytes.length - MAX_PENDING_CHARS)
               : bytes;
           pending.push({
+            command: generateCommand(source),
             sourceId: source.id,
             sourceLabel: source.displayName,
             sourceColor: source.color ?? '#00e5c8',
-            text: decoder.decode(tail),
+            text: (() => {
+              let decoder = decoders.get(sourceIndex);
+              if (!decoder) decoders.set(sourceIndex, (decoder = new TextDecoder()));
+              const text = (partial.get(sourceIndex) ?? '') + decoder.decode(tail, { stream: true });
+              const cut = text.lastIndexOf('\n') + 1;
+              partial.set(sourceIndex, text.slice(cut));
+              return text.slice(0, cut);
+            })(),
           });
           pendingChars += pending[pending.length - 1].text.length;
 

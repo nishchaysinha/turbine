@@ -10,6 +10,10 @@ import type {
   SystemdJournalParams,
   CustomCommandParams,
 } from '../types';
+import { shellQuote } from './shellQuote';
+
+/** Leave plain words as-is; quote anything with spaces or shell metacharacters. */
+const arg = (value: string) => (/^[\w@%+=:,./~-]+$/.test(value) ? value : shellQuote(value));
 
 /** Wire shape of a log source as the Rust backend stores it (snake_case, params as JSON string). */
 export interface RustLogSourceConfig {
@@ -60,7 +64,7 @@ export function generateCommand(source: LogSourceConfig): string {
   switch (source.sourceType) {
     case 'local_file': {
       const params = source.params as LocalFileParams;
-      return `tail -f ${params.filePath}`;
+      return `tail -f ${arg(params.filePath)}`;
     }
 
     case 'docker_container': {
@@ -68,7 +72,7 @@ export function generateCommand(source: LogSourceConfig): string {
       // Default --tail: without it docker dumps the container's entire log
       // history at full speed, which floods the event pipeline.
       const parts = ['docker', 'logs', '-f', '--tail', String(params.tail ?? 1000)];
-      parts.push(params.containerNameOrId);
+      parts.push(arg(params.containerNameOrId));
       return parts.join(' ');
     }
 
@@ -76,25 +80,26 @@ export function generateCommand(source: LogSourceConfig): string {
       const params = source.params as SshRemoteParams;
       const parts = ['ssh'];
       const user = params.user ?? '$(whoami)';
-      parts.push(`${user}@${params.host}`);
+      parts.push(`${user}@${arg(params.host)}`);
       if (params.port != null) {
         parts.push('-p', String(params.port));
       }
       if (params.identityFile != null) {
-        parts.push('-i', params.identityFile);
+        parts.push('-i', arg(params.identityFile));
       }
-      parts.push(`"tail -f ${params.remoteFilePath}"`);
+      // The remote shell parses this string again, so quote the path for it, then the whole command for us.
+      parts.push(shellQuote(`tail -f ${arg(params.remoteFilePath)}`));
       return parts.join(' ');
     }
 
     case 'kubernetes_pod': {
       const params = source.params as KubernetesPodParams;
-      const parts = ['kubectl', 'logs', '-f', params.podName];
+      const parts = ['kubectl', 'logs', '-f', arg(params.podName)];
       if (params.namespace != null) {
-        parts.push('-n', params.namespace);
+        parts.push('-n', arg(params.namespace));
       }
       if (params.containerName != null) {
-        parts.push('-c', params.containerName);
+        parts.push('-c', arg(params.containerName));
       }
       parts.push(`--tail=${params.tail ?? 1000}`);
       return parts.join(' ');
@@ -102,7 +107,7 @@ export function generateCommand(source: LogSourceConfig): string {
 
     case 'systemd_journal': {
       const params = source.params as SystemdJournalParams;
-      const parts = ['journalctl', '-f', '-u', params.unitName];
+      const parts = ['journalctl', '-f', '-u', arg(params.unitName)];
       if (params.lines != null) {
         parts.push(`--lines=${params.lines}`);
       }
@@ -119,6 +124,23 @@ export function generateCommand(source: LogSourceConfig): string {
       throw new Error(`Unknown source type: ${_exhaustive}`);
     }
   }
+}
+
+/**
+ * Clean one line of a log source's PTY output: drop terminal escape codes and
+ * carriage returns, and the shell's echo of the command that started the stream.
+ * Returns null for lines that carry no log text.
+ */
+export function cleanLogLine(raw: string, command: string): string | null {
+  const line = raw
+    .replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, '')
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '')
+    .replace(/\x1b[@-_]/g, '')
+    .replace(/\r/g, '')
+    .replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '');
+  if (!line.trim()) return null;
+  if (line.trimEnd().endsWith(`exec ${command}`)) return null;
+  return line;
 }
 
 /**
@@ -155,7 +177,8 @@ export async function startSource(
   const encoder = new TextEncoder();
   await invoke('pty_write', {
     paneId: syntheticPaneId,
-    data: Array.from(encoder.encode(`${command}\n`)),
+    // exec: the stream replaces the shell, so no prompt follows it into the log.
+    data: Array.from(encoder.encode(`exec ${command}\n`)),
   });
 
   return syntheticPaneId;

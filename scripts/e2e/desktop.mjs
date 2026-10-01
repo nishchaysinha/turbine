@@ -13,7 +13,7 @@
  * Output: docs/testing/desktop/*.png and docs/testing/desktop/README.md
  */
 import { execSync, spawn } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -329,6 +329,50 @@ async function main() {
     assert(!/^\{\}$/m.test(res.text), 'exit marker prints nothing');
     await sleep(1500);
     shot('task-run', 'Task board → Run with an agent: the title is passed literally and the pane reports its exit');
+  });
+
+  await step('Log dashboard: tails a file (path with spaces), clean lines only', async () => {
+    const logDir = join(repo, 'my logs');
+    mkdirSync(logDir, { recursive: true });
+    const logFile = join(logDir, 'app.log');
+    writeFileSync(logFile, 'INFO boot ok\nERROR db timeout\nWARN slow query 900ms\n');
+    await ev(`
+      const W = window.__turbine.workspace;
+      const ws = W.getState().workspaces.find((w) => w.id === W.getState().activeWorkspaceId);
+      const target = ws.panes[ws.panes.length - 1];
+      W.setState((s) => ({ workspaces: s.workspaces.map((w) => w.id === ws.id ? { ...w, panes: w.panes.map((p) => p.id === target.id ? { ...p, type: 'log_dashboard', title: 'Logs' } : p) } : w) }));
+      await new Promise((r) => setTimeout(r, 1200));
+      const root = document.querySelector('.log-dashboard') ?? document.querySelector('[class*=log-dashboard]');
+      [...root.querySelectorAll('button')].find((b) => b.innerText === 'Add Source').click();
+      await new Promise((r) => setTimeout(r, 400));
+      const set = (el, v) => { Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(el, v); el.dispatchEvent(new Event('input', { bubbles: true })); };
+      set([...root.querySelectorAll('input')].find((i) => i.placeholder === 'My Log Source'), 'api');
+      set([...root.querySelectorAll('input')].find((i) => i.placeholder === '/var/log/app.log'), ${JSON.stringify(logFile)});
+      await new Promise((r) => setTimeout(r, 200));
+      [...root.querySelectorAll('button')].filter((b) => b.innerText === 'Add Source').pop().click();
+      return 1;`);
+    await sleep(2000);
+    appendFileSync(logFile, 'INFO half-');
+    await sleep(700);
+    appendFileSync(logFile, 'line joined ✓\n');
+    const messages = await waitFor(async () => {
+      const m = await ev(`return [...document.querySelectorAll('.log-entry-row__message')].map((e) => e.textContent)`);
+      return m.length >= 4 ? m : null;
+    }, 'log entries');
+    assert(
+      JSON.stringify(messages) === JSON.stringify(['INFO boot ok', 'ERROR db timeout', 'WARN slow query 900ms', 'INFO half-line joined ✓']),
+      `only log lines, split line rejoined: ${JSON.stringify(messages)}`,
+    );
+    // Give the log pane the whole window for the screenshot (side panel closed, other panes out of the layout).
+    await ev(`
+      const W = window.__turbine.workspace;
+      const ws = W.getState().workspaces.find((w) => w.id === W.getState().activeWorkspaceId);
+      const logPane = ws.panes.find((p) => p.type === 'log_dashboard');
+      document.querySelector('[aria-label="Tasks"]').click();
+      W.setState((s) => ({ workspaces: s.workspaces.map((w) => w.id === ws.id ? { ...w, layout: { type: 'leaf', paneId: logPane.id } } : w) }));
+      return 1;`);
+    await sleep(1000);
+    shot('log-dashboard', 'Log dashboard tailing a file: levels detected, shell noise filtered, lines split across reads rejoined');
   });
 
   await step('Settings: hook install toggle and renderer switch', async () => {

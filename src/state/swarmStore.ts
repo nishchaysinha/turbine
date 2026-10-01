@@ -9,6 +9,36 @@ import { useAgentStatusStore } from './agentStatusStore';
 const OUTPUT_BUFFER_MAX = 10 * 1024; // 10KB rolling buffer per agent
 let listenerInitPromise: Promise<void> | null = null;
 const processedAgentExits = new Set<string>();
+/** Runs created by this app session. Anything else marked active in the DB is stale:
+ *  Turbine kills agent PTYs on exit, so those processes no longer exist. */
+const sessionRunIds = new Set<string>();
+const ACTIVE_RUN_STATUSES: SwarmStatus[] = ['Initializing', 'Running', 'Reviewing'];
+const INTERRUPTED_SUMMARY = 'Interrupted — Turbine was closed while this agent was running';
+
+/** Mark runs/agents left "active" by a previous app session as failed. Exported for tests. */
+export async function reconcileStaleRuns(runs: SwarmRun[]): Promise<SwarmRun[]> {
+  const now = new Date().toISOString();
+  return Promise.all(
+    runs.map(async (run) => {
+      if (!ACTIVE_RUN_STATUSES.includes(run.status) || sessionRunIds.has(run.id)) return run;
+      try {
+        const agents = await invoke<SwarmAgent[]>('load_swarm_agents', { swarmRunId: run.id });
+        for (const agent of agents) {
+          if (agent.status !== 'running' && agent.status !== 'pending') continue;
+          await invoke('save_swarm_agent', {
+            agent: { ...agent, status: 'failed', completed_at: now, output_summary: agent.output_summary ?? INTERRUPTED_SUMMARY },
+          });
+        }
+        const updated: SwarmRun = { ...run, status: 'Failed', current_role: null, updated_at: now };
+        await invoke('save_swarm_run', { run: updated });
+        return updated;
+      } catch (e) {
+        console.error('Failed to reconcile swarm run', run.id, e);
+        return run;
+      }
+    }),
+  );
+}
 
 /** Strip ANSI escape sequences from raw PTY output. */
 function stripAnsi(text: string): string {
@@ -246,7 +276,7 @@ export const useSwarmStore = create<SwarmState>((set, get) => {
 
   loadRuns: async (projectPath) => {
     try {
-      const runs = await invoke<SwarmRun[]>('load_swarm_runs', { projectPath });
+      const runs = await reconcileStaleRuns(await invoke<SwarmRun[]>('load_swarm_runs', { projectPath }));
       set({ runs });
     } catch (e) {
       console.error('Failed to load swarm runs', e);
@@ -290,6 +320,7 @@ export const useSwarmStore = create<SwarmState>((set, get) => {
       started_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
+    sessionRunIds.add(run.id);
     await invoke('save_swarm_run', { run });
     set((s) => ({ runs: [run, ...s.runs], activeRunId: run.id }));
     return run;
@@ -306,6 +337,7 @@ export const useSwarmStore = create<SwarmState>((set, get) => {
       started_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
     };
+    sessionRunIds.add(run.id);
     await invoke('save_swarm_run', { run });
     set((s) => {
       const runWorkspaceIds = new Map(s.runWorkspaceIds);

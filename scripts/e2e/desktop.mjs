@@ -213,6 +213,24 @@ async function main() {
     shot('agent-done', 'A finished turn shows the agent’s last message and a reply box; a toast fires when you are elsewhere');
   });
 
+  await step('Command palette: jump straight to the agent that needs you', async () => {
+    const agentPane = panes[1];
+    const items = await ev(`
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'P', code: 'KeyP', ctrlKey: true, shiftKey: true, bubbles: true }));
+      await new Promise((r) => setTimeout(r, 400));
+      const input = document.querySelector('.command-palette__input');
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, '>go to');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      await new Promise((r) => setTimeout(r, 300));
+      return [...document.querySelectorAll('.command-palette__item')].map((el) => el.innerText.replace(/\\s+/g, ' '));`);
+    assert(items.length >= 2 && items[0].includes('Needs you'), `blocked agent listed first: ${JSON.stringify(items)}`);
+    shot('palette-agent-jump', 'Command palette (Ctrl+Shift+P): agents sorted by who needs you, one keystroke away');
+    await ev(`document.querySelector('.command-palette__item').click(); return 1;`);
+    await sleep(300);
+    const after = await ev(`return { open: Boolean(document.querySelector('.command-palette')), unread: Boolean(window.__turbine.agentStatus.getState().unread[${JSON.stringify(agentPane)}]) }`);
+    assert(!after.open && !after.unread, `jumped and marked read: ${JSON.stringify(after)}`);
+  });
+
   await step('Review: all changes include staged, unstaged and new files', async () => {
     const summary = await ev(`
       const T = window.__turbine;
@@ -260,6 +278,22 @@ async function main() {
       return [...document.querySelectorAll('.diff-file-item__name')].map((e) => e.innerText);`);
     assert(files.includes('server.ts'), `committed branch change shown: ${files}`);
     shot('review-branch', 'Branch scope: everything on feature/rate-limit since it left main');
+  });
+
+  await step('Swarm: runs left running by a previous session are marked interrupted', async () => {
+    const res = await ev(`
+      const now = new Date().toISOString();
+      const run = { id: 'stale-' + Date.now(), task_id: null, project_path: ${JSON.stringify(repo)}, status: 'Running', current_role: 'Builder', prompt: 'Left running when Turbine quit', started_at: now, updated_at: now };
+      await window.__dbgInvoke('save_swarm_run', { run });
+      await window.__dbgInvoke('save_swarm_agent', { agent: { id: run.id + '-a', swarm_run_id: run.id, preset_id: null, pane_id: 'gone', role: 'Builder', command: 'x', status: 'running', exit_code: null, output_summary: null, started_at: now, completed_at: null } });
+      await window.__turbine.swarm.getState().loadRuns(${JSON.stringify(repo)});
+      const agents = await window.__dbgInvoke('load_swarm_agents', { swarmRunId: run.id });
+      window.__turbine.swarm.getState().setActiveRun(null);
+      document.querySelector('[aria-label="Swarm"]').click();
+      await new Promise((r) => setTimeout(r, 600));
+      return { run: window.__turbine.swarm.getState().runs.find((r) => r.id === run.id)?.status, agent: agents[0].status, summary: agents[0].output_summary };`);
+    assert(res.run === 'Failed' && res.agent === 'failed' && /Interrupted/.test(res.summary), `stale run reconciled: ${JSON.stringify(res)}`);
+    shot('swarm-interrupted', 'Swarm runs whose agents died with the app show as Failed (interrupted) instead of running forever');
   });
 
   await step('Settings: hook install toggle and renderer switch', async () => {

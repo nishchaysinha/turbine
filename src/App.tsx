@@ -33,7 +33,7 @@ import { BroadcastOverlay } from './components/terminal/BroadcastOverlay';
 import { ShortcutSheet } from './components/overlays/ShortcutSheet';
 import { CompanionModal } from './components/overlays/CompanionModal';
 import { p2pBridge } from './services/p2pBridge';
-import { useAgentStatusStore, withExitMarker } from './state/agentStatusStore';
+import { AGENT_STATE_LABELS, useAgentStatusStore, withExitMarker } from './state/agentStatusStore';
 import './App.css';
 
 function replaceLeafPaneId(node: import('./types').LayoutNode, fromId: string, toId: string): import('./types').LayoutNode {
@@ -148,6 +148,7 @@ function App() {
   usePtyAttentionListener(focusedPaneId);
   useAgentNotifications(focusedPaneId);
 
+  const agentRows = useAgentStatusStore((s) => s.rows);
   const handleFocusAgentPane = useCallback((workspaceId: string, paneId: string) => {
     setShowHome(false);
     useWorkspaceStore.getState().switchWorkspace(workspaceId);
@@ -847,8 +848,25 @@ function App() {
       });
     }
 
+    // Agents command center: open the panel, or jump straight to an agent (blocked first)
+    actions.push({ id: 'agents-panel', label: 'Show Agents', category: 'Agents', type: 'command', handler: () => setActivePanel('agents') });
+    const STATE_ORDER = { blocked: 0, done: 1, working: 2, waiting: 3 } as const;
+    const agentPanes = workspaces
+      .flatMap((ws) => ws.panes.map((pane) => ({ ws, pane, row: agentRows[pane.id] })))
+      .filter((x) => x.row)
+      .sort((a, b) => STATE_ORDER[a.row.state] - STATE_ORDER[b.row.state] || b.row.updatedAt - a.row.updatedAt);
+    for (const { ws, pane, row } of agentPanes) {
+      actions.push({
+        id: `agent-${pane.id}`,
+        label: `Go to ${row.agent} (${AGENT_STATE_LABELS[row.state]}) — ${ws.name}${pane.title ? ` · ${pane.title}` : ''}`,
+        category: 'Agents',
+        type: 'command',
+        handler: () => handleFocusAgentPane(ws.id, pane.id),
+      });
+    }
+
     return actions;
-  }, [workspaces, focusedPaneId, activeWorkspace, activeWorkspaceId, createWorkspace, switchWorkspace, handleSplitH, handleSplitV, handleClosePane, handleApplyTemplate, toggleBroadcast, projectFiles, handleOpenFile, handleRefreshProjectFiles]);
+  }, [agentRows, handleFocusAgentPane, workspaces, focusedPaneId, activeWorkspace, activeWorkspaceId, createWorkspace, switchWorkspace, handleSplitH, handleSplitV, handleClosePane, handleApplyTemplate, toggleBroadcast, projectFiles, handleOpenFile, handleRefreshProjectFiles]);
 
   if (loading) {
     return (

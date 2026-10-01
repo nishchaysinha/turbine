@@ -48,8 +48,11 @@ export function useAgentNotifications(focusedPaneId: string | null) {
   useEffect(
     () =>
       useAgentStatusStore.getState().onTransition(async (row, prev) => {
-        if (prev?.state === row.state) return;
-        if (row.state !== 'blocked' && !(row.state === 'done' && prev?.state === 'working')) return;
+        const exited = row.exitCode !== null && prev?.exitCode !== row.exitCode;
+        const blocked = row.state === 'blocked' && prev?.state !== 'blocked';
+        // A finished turn, or a process exit (agents without hooks only ever report that).
+        const finished = row.state === 'done' && (prev?.state === 'working' || exited);
+        if (!blocked && !finished) return;
         const text = describe(row);
         if (!text) return;
 

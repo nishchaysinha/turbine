@@ -11,6 +11,7 @@ import {
 import { socketService } from '../services/socketService';
 import type { SwarmRun, SwarmAgent, AgentPresetInfo } from '../types';
 import { HistoryView } from '../components/HistoryView';
+import { TasksScreen } from './TasksScreen';
 import * as Haptics from 'expo-haptics';
 
 export const SwarmScreen: React.FC = () => {
@@ -20,7 +21,7 @@ export const SwarmScreen: React.FC = () => {
   const [promptText, setPromptText] = useState('');
   const [presets, setPresets] = useState<AgentPresetInfo[]>(socketService.presets);
   const [presetId, setPresetId] = useState<string | undefined>(undefined);
-  const [segment, setSegment] = useState<'live' | 'history'>('live');
+  const [segment, setSegment] = useState<'live' | 'history' | 'tasks'>('live');
   const [replyAgent, setReplyAgent] = useState<SwarmAgent | null>(null);
   const [replyText, setReplyText] = useState('');
 
@@ -71,20 +72,22 @@ export const SwarmScreen: React.FC = () => {
       </View>
 
       <View style={styles.segments}>
-        {(['live', 'history'] as const).map((seg) => (
+        {(['live', 'history', 'tasks'] as const).map((seg) => (
           <TouchableOpacity
             key={seg}
             style={[styles.segment, segment === seg && styles.segmentActive]}
             onPress={() => setSegment(seg)}
           >
             <Text style={[styles.segmentText, segment === seg && styles.segmentTextActive]}>
-              {seg === 'live' ? `Live${runs.length ? ` (${runs.length})` : ''}` : 'History'}
+              {seg === 'live' ? `Live${runs.length ? ` (${runs.length})` : ''}` : seg === 'history' ? 'History' : 'Tasks'}
             </Text>
           </TouchableOpacity>
         ))}
       </View>
 
-      {segment === 'history' ? (
+      {segment === 'tasks' ? (
+        <TasksScreen />
+      ) : segment === 'history' ? (
         <HistoryView onRerun={() => setSegment('live')} />
       ) : (
       /* Swarm Runs List */

@@ -3,11 +3,11 @@ import { View, Text, TouchableOpacity, StyleSheet, SafeAreaView } from 'react-na
 import type { ActiveTab } from '../types';
 import { TerminalWorkspaceScreen } from '../screens/TerminalWorkspaceScreen';
 import { SwarmScreen } from '../screens/SwarmScreen';
-import { TasksScreen } from '../screens/TasksScreen';
+import { AgentsScreen } from '../screens/AgentsScreen';
 import { CodeScreen } from '../screens/CodeScreen';
 import { SettingsScreen } from '../screens/SettingsScreen';
 import { socketService } from '../services/socketService';
-import { onAgentFinished } from '../services/notifier';
+import { onAgentFinished, onAgentStatusAnnouncement } from '../services/notifier';
 import * as Haptics from 'expo-haptics';
 
 interface AppNavigatorProps {
@@ -15,21 +15,23 @@ interface AppNavigatorProps {
 }
 
 const TABS: { id: ActiveTab; label: string; icon: string }[] = [
-  { id: 'workspace', label: 'Workspace', icon: '📟' },
-  { id: 'swarm', label: 'Swarm', icon: '🤖' },
-  { id: 'tasks', label: 'Tasks', icon: '📋' },
+  { id: 'agents', label: 'Agents', icon: '🛰️' },
+  { id: 'workspace', label: 'Terminals', icon: '📟' },
+  { id: 'swarm', label: 'Runs', icon: '🤖' },
   { id: 'code', label: 'Code', icon: '📁' },
   { id: 'settings', label: 'Control', icon: '⚙️' },
 ];
 
 export const AppNavigator: React.FC<AppNavigatorProps> = ({ onDisconnect }) => {
-  const [activeTab, setActiveTab] = useState<ActiveTab>('workspace');
+  const [activeTab, setActiveTab] = useState<ActiveTab>('agents');
+  const [needsYou, setNeedsYou] = useState(0);
   const [reconnecting, setReconnecting] = useState(socketService.reconnecting);
   const [commandError, setCommandError] = useState<string | null>(null);
 
   useEffect(() => {
     return socketService.subscribe(() => {
       setReconnecting(socketService.reconnecting);
+      setNeedsYou(Object.values(socketService.agentStatus).filter((r) => r.state === 'blocked').length);
       if (socketService.lastCommandError) {
         setCommandError(socketService.lastCommandError);
         socketService.lastCommandError = null;
@@ -38,13 +40,21 @@ export const AppNavigator: React.FC<AppNavigatorProps> = ({ onDisconnect }) => {
   }, []);
 
   const [agentToast, setAgentToast] = useState<string | null>(null);
-  useEffect(
-    () =>
-      onAgentFinished((e) =>
-        setAgentToast(`${e.kind === 'completed' ? '✅' : '⚠️'} ${e.agent.role} ${e.kind === 'completed' ? 'finished' : 'failed'}`)
-      ),
-    []
-  );
+  const [toastTab, setToastTab] = useState<ActiveTab>('swarm');
+  useEffect(() => {
+    const offLegacy = onAgentFinished((e) => {
+      setToastTab('swarm');
+      setAgentToast(`${e.kind === 'completed' ? '✅' : '⚠️'} ${e.agent.role} ${e.kind === 'completed' ? 'finished' : 'failed'}`);
+    });
+    const offStatus = onAgentStatusAnnouncement((a) => {
+      setToastTab('agents');
+      setAgentToast(a.title);
+    });
+    return () => {
+      offLegacy();
+      offStatus();
+    };
+  }, []);
   useEffect(() => {
     if (!agentToast) return;
     const t = setTimeout(() => setAgentToast(null), 6000);
@@ -66,12 +76,19 @@ export const AppNavigator: React.FC<AppNavigatorProps> = ({ onDisconnect }) => {
 
   const renderActiveScreen = () => {
     switch (activeTab) {
+      case 'agents':
+        return (
+          <AgentsScreen
+            onOpenPane={(paneId) => {
+              socketService.pendingFocusPaneId = paneId;
+              setActiveTab('workspace');
+            }}
+          />
+        );
       case 'workspace':
         return <TerminalWorkspaceScreen />;
       case 'swarm':
         return <SwarmScreen />;
-      case 'tasks':
-        return <TasksScreen />;
       case 'code':
         return <CodeScreen />;
       case 'settings':
@@ -99,7 +116,7 @@ export const AppNavigator: React.FC<AppNavigatorProps> = ({ onDisconnect }) => {
           style={[styles.banner, styles.bannerAgent]}
           onPress={() => {
             setAgentToast(null);
-            setActiveTab('swarm');
+            setActiveTab(toastTab);
           }}
         >
           <Text style={styles.bannerText}>{agentToast} — tap to view</Text>
@@ -123,6 +140,11 @@ export const AppNavigator: React.FC<AppNavigatorProps> = ({ onDisconnect }) => {
               <Text style={[styles.tabIcon, isActive && styles.tabIconActive]}>
                 {tab.icon}
               </Text>
+              {tab.id === 'agents' && needsYou > 0 && (
+                <View style={styles.tabBadge}>
+                  <Text style={styles.tabBadgeText}>{needsYou}</Text>
+                </View>
+              )}
               <Text style={[styles.tabLabel, isActive && styles.tabLabelActive]}>
                 {tab.label}
               </Text>
@@ -173,6 +195,19 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     paddingVertical: 4,
   },
+  tabBadge: {
+    position: 'absolute',
+    top: 0,
+    right: '28%',
+    minWidth: 16,
+    height: 16,
+    borderRadius: 8,
+    paddingHorizontal: 4,
+    backgroundColor: '#ffcb6b',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  tabBadgeText: { color: '#1a1300', fontSize: 10, fontWeight: '800' },
   tabIcon: {
     fontSize: 18,
     marginBottom: 2,

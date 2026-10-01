@@ -52,6 +52,16 @@ export const SettingsScreen: React.FC<SettingsScreenProps> = ({ onDisconnect }) 
           <Text style={styles.infoValue}>{status !== 'connected' ? '—' : latencyMs !== null ? `⚡ ${latencyMs}ms` : 'measuring…'}</Text>
         </View>
         <View style={styles.infoRow}>
+          <Text style={styles.infoLabel}>Protocol:</Text>
+          <Text style={styles.infoValue}>
+            {socketService.hostProtocol === null
+              ? 'negotiating…'
+              : socketService.hostProtocol >= 2
+                ? `v${socketService.hostProtocol} (${[...socketService.hostCapabilities].join(', ')})`
+                : 'v1 (legacy desktop)'}
+          </Text>
+        </View>
+        <View style={styles.infoRow}>
           <Text style={styles.infoLabel}>Pairing code:</Text>
           <Text style={styles.infoValue}>{socketService.pairingCode}</Text>
         </View>

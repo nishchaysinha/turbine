@@ -5,6 +5,17 @@ import { useSwarmStore } from '../state/swarmStore';
 import { useAgentStore } from '../state/agentStore';
 import type { RelayConnectionStatus, RelaySessionInfo, RelayPeerInfo } from '../types/relay';
 import { onPtyOutput } from '../utils/ptyData';
+import { useAgentStatusStore } from '../state/agentStatusStore';
+import { agentActions } from './agentActions';
+import {
+  CAPABILITIES,
+  HOST_CAPABILITIES,
+  PROTOCOL_VERSION,
+  RpcError,
+  type AgentAction,
+  type RpcRequest,
+  type RpcResponse,
+} from './companionProtocol';
 
 type StatusListener = (status: RelayConnectionStatus) => void;
 type PeerListener = (peers: RelayPeerInfo[]) => void;
@@ -137,6 +148,10 @@ export class P2PBridge {
   private storeUnsubs: Array<() => void> = [];
   private fileTreeCache = new Map<string, { at: number; entries: FileTreeEntry[]; statuses: Record<string, string> }>();
   private terminalBuffers = new Map<string, string>();
+  /** Capabilities the connected phone advertised in `hello` (empty = legacy client). */
+  private peerCaps = new Set<string>();
+  /** Panes the phone wants output for; null streams everything (legacy clients). */
+  private subscribedPanes: Set<string> | null = null;
   private terminalDimensions = new Map<string, { cols: number; rows: number }>();
 
   private statusListeners = new Set<StatusListener>();
@@ -437,6 +452,8 @@ export class P2PBridge {
     }
     if (this.peers.length > 0) this.setPeers([]);
     this.latencyMs = null;
+    this.peerCaps = new Set();
+    this.subscribedPanes = null;
   }
 
   /** Stop pairing entirely. The remembered code stays valid for the next Start. */
@@ -476,6 +493,7 @@ export class P2PBridge {
   public sendTerminalOutput(paneId: string, data: string) {
     const cur = this.terminalBuffers.get(paneId) || '';
     this.terminalBuffers.set(paneId, (cur + data).slice(-TERMINAL_BUFFER_BYTES));
+    if (this.subscribedPanes && !this.subscribedPanes.has(paneId)) return;
     this.send('terminal:output', { paneId, data });
   }
 
@@ -517,15 +535,17 @@ export class P2PBridge {
       swarmAgents: agents,
       presets: useAgentStore.getState().presets.map((p) => ({ id: p.id, name: p.name, role: p.role })),
       activePaneId: this.activePaneId,
+      // Optional (protocol rule 1): older phones ignore it.
+      agentStatus: Object.values(useAgentStatusStore.getState().rows),
     });
   }
 
-  /** Full state + every terminal's replay buffer. Sent once when the phone connects. */
+  /** Full state + terminal replay buffers. Sent once when the phone connects. */
   public syncFullState() {
     if (!this.isConnected()) return;
     this.syncState();
     for (const paneId of this.terminalDimensions.keys()) {
-      this.sendTerminalSync(paneId);
+      if (!this.subscribedPanes || this.subscribedPanes.has(paneId)) this.sendTerminalSync(paneId);
     }
   }
 
@@ -556,6 +576,16 @@ export class P2PBridge {
       }),
       useAgentStore.subscribe((s, prev) => {
         if (s.presets !== prev.presets) this.syncState();
+      }),
+      // Mirror the host's agent status store row by row (Orca: one store, every reader subscribes).
+      useAgentStatusStore.subscribe((s, prev) => {
+        if (s.rows === prev.rows) return;
+        for (const [paneId, row] of Object.entries(s.rows)) {
+          if (prev.rows[paneId] !== row) this.send('agents:status', { row });
+        }
+        for (const paneId of Object.keys(prev.rows)) {
+          if (!s.rows[paneId]) this.send('agents:clear', { paneId });
+        }
       }),
     );
   }
@@ -592,6 +622,11 @@ export class P2PBridge {
     try {
       const payload = msg.payload || {};
       switch (msg.type) {
+        case 'rpc': {
+          await this.handleRpc(payload as RpcRequest);
+          break;
+        }
+
         case 'terminal:request_sync': {
           const targetPane = payload.paneId || this.activePaneId;
           if (targetPane) this.sendTerminalSync(targetPane);
@@ -658,13 +693,7 @@ export class P2PBridge {
         }
 
         case 'diff:request': {
-          const projectPath = this.resolveProjectPath(payload.projectPath);
-          try {
-            const diff = await invoke<string>('get_git_diff', { path: projectPath });
-            this.send('diff:data', { projectPath, diff });
-          } catch (e) {
-            this.send('diff:data', { projectPath, diff: '', error: String(e) });
-          }
+          this.send('diff:data', await this.gitDiff(payload.projectPath));
           break;
         }
 
@@ -731,13 +760,16 @@ export class P2PBridge {
     return fresh;
   }
 
-  /** One directory level at a time, like Orca's lazy explorer: cheap to send, cheap to render. */
   private async sendDirectoryListing(requested: unknown, refresh: boolean) {
+    this.send('files:listing', await this.listDirectory(requested, refresh));
+  }
+
+  /** One directory level at a time, like Orca's lazy explorer: cheap to send, cheap to render. */
+  private async listDirectory(requested: unknown, refresh: boolean): Promise<Record<string, unknown>> {
     const root = this.resolveProjectPath();
     const dir = safeRelativePath(requested);
     if (dir === null) {
-      this.send('files:listing', { root, path: String(requested), entries: [], error: 'Path is outside the project' });
-      return;
+      return { root, path: String(requested), entries: [], error: 'Path is outside the project' };
     }
     try {
       const tree = await this.loadFileTree(root, refresh);
@@ -751,18 +783,21 @@ export class P2PBridge {
           status: statusForEntry(e.relativePath, e.isDir, tree.statuses),
         }))
         .filter((e) => e.name);
-      this.send('files:listing', { root, path: dir, entries });
+      return { root, path: dir, entries };
     } catch (e) {
-      this.send('files:listing', { root, path: dir, entries: [], error: String(e) });
+      return { root, path: dir, entries: [], error: String(e) };
     }
   }
 
   private async sendFileContent(requested: unknown) {
+    this.send('files:content', await this.readProjectFile(requested));
+  }
+
+  private async readProjectFile(requested: unknown): Promise<Record<string, unknown>> {
     const root = this.resolveProjectPath();
     const rel = safeRelativePath(requested);
     if (!rel) {
-      this.send('files:content', { path: String(requested), content: '', error: 'Path is outside the project' });
-      return;
+      return { path: String(requested), content: '', error: 'Path is outside the project' };
     }
     try {
       const file = await invoke<FileContent>('read_file', {
@@ -771,20 +806,24 @@ export class P2PBridge {
         limit: FILE_PREVIEW_BYTES,
       });
       const binary = file.content.slice(0, 4096).includes('\u0000');
-      this.send('files:content', {
+      return {
         path: rel,
         content: binary ? '' : file.content,
         binary,
         truncated: !file.isComplete,
         totalSize: file.totalSize,
-      });
+      };
     } catch (e) {
-      this.send('files:content', { path: rel, content: '', error: String(e) });
+      return { path: rel, content: '', error: String(e) };
     }
   }
 
-  /** Past swarm runs for the active project, newest first, each with its agents. */
   private async sendRunHistory() {
+    this.send('history:data', await this.runHistory());
+  }
+
+  /** Past swarm runs for the active project, newest first, each with its agents. */
+  private async runHistory(): Promise<Record<string, unknown>> {
     const projectPath = this.resolveProjectPath();
     try {
       const runs = (await invoke<Array<Record<string, any>>>('load_swarm_runs', { projectPath })) ?? [];
@@ -808,16 +847,16 @@ export class P2PBridge {
           return { ...run, ...(liveRun ?? {}), agents };
         }),
       );
-      this.send('history:data', { projectPath, runs: withAgents });
+      return { projectPath, runs: withAgents };
     } catch (e) {
-      this.send('history:data', { projectPath, runs: [], error: String(e) });
+      return { projectPath, runs: [], error: String(e) };
     }
   }
 
   /** Create a run and actually spawn an agent for it (a bare run does nothing). */
   private async startSwarm(payload: { prompt?: unknown; presetId?: unknown; taskId?: unknown }) {
     const prompt = typeof payload.prompt === 'string' ? payload.prompt.trim() : '';
-    if (!prompt) return;
+    if (!prompt) throw new RpcError('bad_params', 'A prompt is required');
 
     const agentStore = useAgentStore.getState();
     if (agentStore.presets.length === 0) await agentStore.loadPresets();
@@ -832,8 +871,146 @@ export class P2PBridge {
     const ws = useWorkspaceStore.getState();
     const swarm = useSwarmStore.getState();
     const run = await swarm.startAdHocRun(projectPath, prompt, ws.activeWorkspaceId ?? undefined, this.activePaneId);
-    await swarm.spawnAgent(run.id, preset.id, prompt, projectPath);
+    const agent = await swarm.spawnAgent(run.id, preset.id, prompt, projectPath);
     this.send('swarm:updated', this.swarmSnapshot());
+    return { runId: run.id, agentId: agent.id, paneId: agent.pane_id, preset: preset.name };
+  }
+
+  private async gitDiff(requested: unknown) {
+    const projectPath = this.resolveProjectPath(requested);
+    try {
+      return { projectPath, diff: await invoke<string>('get_git_diff', { path: projectPath }) };
+    } catch (e) {
+      return { projectPath, diff: '', error: String(e) };
+    }
+  }
+
+  private findPaneWorkspace(paneId: string) {
+    return useWorkspaceStore.getState().workspaces.find((w) => w.panes.some((p) => p.id === paneId));
+  }
+
+  private async runAgentAction(paneId: string, action: AgentAction, text?: string) {
+    const known = useAgentStatusStore.getState().rows[paneId] || this.findPaneWorkspace(paneId);
+    if (!known && !paneId.startsWith('swarm-')) throw new RpcError('not_found', `Unknown pane ${paneId}`);
+    switch (action) {
+      case 'approve':
+        return agentActions.approve(paneId);
+      case 'deny':
+        return agentActions.deny(paneId);
+      case 'interrupt':
+        return agentActions.interrupt(paneId);
+      case 'prompt':
+        if (!text?.trim()) throw new RpcError('bad_params', 'Prompt text is required');
+        return agentActions.sendPrompt(paneId, text);
+      default:
+        throw new RpcError('bad_params', `Unknown agent action ${String(action)}`);
+    }
+  }
+
+  /**
+   * Request/response handling (protocol v2). Every method answers with a
+   * result or a structured error, so the phone can show exactly what failed.
+   */
+  private async handleRpc(req: RpcRequest) {
+    if (!req || typeof req.id !== 'string' || typeof req.method !== 'string') return;
+    const params = (req.params ?? {}) as Record<string, any>;
+    const reply = (res: RpcResponse) => this.send('rpc:result', res);
+    try {
+      const result = await this.dispatchRpc(req.method, params);
+      reply({ id: req.id, ok: true, result });
+    } catch (e) {
+      const code = e instanceof RpcError ? e.code : 'failed';
+      reply({ id: req.id, ok: false, error: { code, message: e instanceof Error ? e.message : String(e) } });
+    }
+  }
+
+  private async dispatchRpc(method: string, params: Record<string, any>): Promise<unknown> {
+    switch (method) {
+      case 'hello': {
+        const caps: unknown[] = Array.isArray(params.capabilities) ? params.capabilities : [];
+        this.peerCaps = new Set(caps.filter((c): c is string => typeof c === 'string'));
+        // Only switch to subscription streaming once the phone has said it supports it.
+        if (this.peerCaps.has(CAPABILITIES.terminalSubscribe) && !this.subscribedPanes) this.subscribedPanes = new Set();
+        return {
+          protocol: PROTOCOL_VERSION,
+          capabilities: HOST_CAPABILITIES,
+          host: { app: 'turbine', platform: typeof navigator !== 'undefined' ? navigator.platform : 'unknown' },
+        };
+      }
+      case 'state.get': {
+        const ws = useWorkspaceStore.getState();
+        const { runs, agents } = this.swarmSnapshot();
+        return {
+          workspaces: ws.workspaces,
+          activeWorkspaceId: ws.activeWorkspaceId,
+          tasks: useTaskStore.getState().tasks,
+          swarmRuns: runs,
+          swarmAgents: agents,
+          presets: useAgentStore.getState().presets.map((p) => ({ id: p.id, name: p.name, role: p.role })),
+          activePaneId: this.activePaneId,
+          agentStatus: Object.values(useAgentStatusStore.getState().rows),
+        };
+      }
+      case 'terminal.subscribe': {
+        const ids: string[] = Array.isArray(params.paneIds) ? params.paneIds.filter((x: unknown) => typeof x === 'string') : [];
+        const prev = this.subscribedPanes ?? new Set<string>();
+        this.subscribedPanes = new Set(ids);
+        // Newly visible panes get their replay buffer so the phone can paint immediately.
+        for (const id of ids) if (!prev.has(id)) this.sendTerminalSync(id);
+        return { subscribed: ids };
+      }
+      case 'terminal.input': {
+        if (typeof params.paneId !== 'string' || typeof params.data !== 'string') {
+          throw new RpcError('bad_params', 'paneId and data are required');
+        }
+        await invoke('pty_write', { paneId: params.paneId, data: Array.from(new TextEncoder().encode(params.data)) });
+        return null;
+      }
+      case 'agents.list':
+        return Object.values(useAgentStatusStore.getState().rows);
+      case 'agents.action': {
+        if (typeof params.paneId !== 'string') throw new RpcError('bad_params', 'paneId is required');
+        await this.runAgentAction(params.paneId, params.action as AgentAction, params.text);
+        return null;
+      }
+      case 'workspace.switch': {
+        const st = useWorkspaceStore.getState();
+        if (!st.workspaces.some((w) => w.id === params.workspaceId)) throw new RpcError('not_found', 'Unknown workspace');
+        st.switchWorkspace(params.workspaceId);
+        return { activeWorkspaceId: params.workspaceId };
+      }
+      case 'task.create': {
+        const title = typeof params.title === 'string' ? params.title.trim() : '';
+        if (!title) throw new RpcError('bad_params', 'A title is required');
+        await useTaskStore.getState().createTask(this.resolveProjectPath(params.projectPath), title);
+        return { tasks: useTaskStore.getState().tasks };
+      }
+      case 'task.updateStatus': {
+        const taskStore = useTaskStore.getState();
+        const existing = taskStore.tasks.find((t) => t.id === params.id);
+        if (!existing) throw new RpcError('not_found', 'Unknown task');
+        await taskStore.updateTask({ ...existing, status: String(params.status) });
+        return { tasks: useTaskStore.getState().tasks };
+      }
+      case 'diff.get':
+        return this.gitDiff(params.projectPath);
+      case 'files.list':
+        return this.listDirectory(params.path, params.refresh === true);
+      case 'files.read':
+        return this.readProjectFile(params.path);
+      case 'history.list':
+        return this.runHistory();
+      case 'swarm.start':
+        return this.startSwarm(params);
+      case 'swarm.kill': {
+        if (typeof params.agentId !== 'string') throw new RpcError('bad_params', 'agentId is required');
+        await useSwarmStore.getState().killAgent(params.agentId);
+        this.send('swarm:updated', this.swarmSnapshot());
+        return null;
+      }
+      default:
+        throw new RpcError('unknown_method', `Unknown method ${method}`);
+    }
   }
 }
 

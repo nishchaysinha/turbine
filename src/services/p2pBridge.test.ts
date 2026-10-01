@@ -228,3 +228,81 @@ describe('P2PBridge files and history', () => {
     expect(run.agents).toEqual([{ id: 'live-agent', status: 'completed' }]);
   });
 });
+
+describe('P2PBridge protocol v2 (rpc)', () => {
+  const rpc = async (receive: (t: string, p?: unknown) => Promise<void>, sent: Sent[], method: string, params?: unknown) => {
+    const id = `r${Math.random()}`;
+    await receive('rpc', { id, method, params });
+    return sent.find((m) => m.type === 'rpc:result' && m.payload.id === id)!.payload;
+  };
+
+  it('negotiates capabilities in hello', async () => {
+    const { receive, sent } = connectedBridge();
+    const res = await rpc(receive, sent, 'hello', { protocol: 2, capabilities: ['rpc', 'terminal.subscribe'] });
+    expect(res).toMatchObject({ ok: true, result: { protocol: 2, capabilities: expect.arrayContaining(['rpc', 'agents', 'terminal.subscribe']) } });
+  });
+
+  it('streams terminal output only for subscribed panes once negotiated', async () => {
+    const { bridge, receive, sent } = connectedBridge();
+    bridge.sendTerminalOutput('p1', 'legacy');
+    expect(sent.filter((m) => m.type === 'terminal:output')).toHaveLength(1);
+
+    await rpc(receive, sent, 'hello', { capabilities: ['rpc', 'terminal.subscribe'] });
+    bridge.sendTerminalOutput('p1', 'hidden');
+    expect(sent.filter((m) => m.type === 'terminal:output')).toHaveLength(1);
+
+    await rpc(receive, sent, 'terminal.subscribe', { paneIds: ['p1'] });
+    // Subscribing replays the buffer (including output produced while hidden).
+    expect(last(sent.filter((m) => m.type === 'terminal:sync'))?.payload.buffer).toBe('legacyhidden');
+    bridge.sendTerminalOutput('p1', 'live');
+    expect(last(sent.filter((m) => m.type === 'terminal:output'))?.payload.data).toBe('live');
+  });
+
+  it('keeps streaming everything for legacy phones that never say hello', () => {
+    const { bridge, sent } = connectedBridge();
+    bridge.sendTerminalOutput('p9', 'x');
+    expect(last(sent)?.type).toBe('terminal:output');
+  });
+
+  it('returns structured errors', async () => {
+    const { receive, sent } = connectedBridge();
+    expect(await rpc(receive, sent, 'nope')).toMatchObject({ ok: false, error: { code: 'unknown_method' } });
+    expect(await rpc(receive, sent, 'task.create', { title: '  ' })).toMatchObject({ ok: false, error: { code: 'bad_params' } });
+    expect(await rpc(receive, sent, 'workspace.switch', { workspaceId: 'zzz' })).toMatchObject({ ok: false, error: { code: 'not_found' } });
+    expect(await rpc(receive, sent, 'agents.action', { paneId: 'ghost', action: 'approve' })).toMatchObject({
+      ok: false,
+      error: { code: 'not_found' },
+    });
+  });
+
+  it('runs agent actions against the pane PTY', async () => {
+    const { receive, sent } = connectedBridge();
+    expect(await rpc(receive, sent, 'agents.action', { paneId: 'p1', action: 'approve' })).toMatchObject({ ok: true });
+    expect(invokeMock).toHaveBeenCalledWith('pty_write', { paneId: 'p1', data: [13] });
+    await rpc(receive, sent, 'agents.action', { paneId: 'p1', action: 'prompt', text: 'line one\nline two' });
+    const writes = invokeMock.mock.calls.filter((c) => c[0] === 'pty_write');
+    const data = writes[writes.length - 1][1].data as number[];
+    expect(new TextDecoder().decode(new Uint8Array(data))).toBe('\x1b[200~line one\nline two\x1b[201~\r');
+  });
+
+  it('answers diff.get and state.get with results', async () => {
+    const { receive, sent } = connectedBridge();
+    invokeMock.mockResolvedValueOnce('diff --git a b');
+    expect(await rpc(receive, sent, 'diff.get', {})).toMatchObject({ ok: true, result: { projectPath: '/repo', diff: 'diff --git a b' } });
+    const state = await rpc(receive, sent, 'state.get');
+    expect(state.result.workspaces).toHaveLength(1);
+    expect(Array.isArray(state.result.agentStatus)).toBe(true);
+  });
+
+  it('mirrors agent status rows to the phone', async () => {
+    const { useAgentStatusStore } = await import('../state/agentStatusStore');
+    const { bridge, sent } = connectedBridge();
+    (bridge as any).watchStores();
+    const row = { paneId: 'p1', state: 'blocked', agent: 'claude', prompt: null, tool: null, toolInput: null, message: 'perm', exitCode: null, sessionId: null, startedAt: 1, updatedAt: 1, lastEvent: 'Notification' };
+    useAgentStatusStore.setState({ rows: { p1: row as any } });
+    expect(last(sent)).toMatchObject({ type: 'agents:status', payload: { row: { paneId: 'p1', state: 'blocked' } } });
+    useAgentStatusStore.setState({ rows: {} });
+    expect(last(sent)).toMatchObject({ type: 'agents:clear', payload: { paneId: 'p1' } });
+    (bridge as any).unwatchStores();
+  });
+});

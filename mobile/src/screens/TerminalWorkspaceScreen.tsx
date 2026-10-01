@@ -40,10 +40,31 @@ export const TerminalWorkspaceScreen: React.FC = () => {
     socketService.setFocusedPane(paneId);
   };
 
+  // Opened from the Agents tab: jump to that pane (switching workspace if needed).
+  useEffect(() => {
+    const target = socketService.pendingFocusPaneId;
+    if (!target) return;
+    socketService.pendingFocusPaneId = null;
+    const ws = socketService.workspaces.find((w) => w.panes.some((p) => p.id === target));
+    if (ws && ws.id !== socketService.activeWorkspaceId) socketService.switchWorkspace(ws.id);
+    setFocusedPaneId(target);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const activeWorkspace =
     workspaces.find((w) => w.id === activeWorkspaceId) || workspaces[0];
 
   const focusedPane = activeWorkspace?.panes.find((p) => p.id === focusedPaneId);
+
+  // Only stream what's on screen: the focused pane, or the tiles of this workspace.
+  const visiblePaneIds = focusedPane
+    ? [focusedPane.id]
+    : (activeWorkspace?.panes ?? []).filter((p) => p.type === 'terminal' || p.id.startsWith('swarm-')).map((p) => p.id);
+  const visibleKey = visiblePaneIds.join('|');
+  useEffect(() => {
+    socketService.subscribeTerminals(visibleKey ? visibleKey.split('|') : []);
+  }, [visibleKey]);
+  useEffect(() => () => socketService.subscribeTerminals([]), []);
 
   if (!activeWorkspace) {
     return (

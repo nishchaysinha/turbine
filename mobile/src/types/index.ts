@@ -64,4 +64,4 @@ export interface AgentPresetInfo {
 
 export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
 
-export type ActiveTab = 'workspace' | 'swarm' | 'tasks' | 'code' | 'settings';
+export type ActiveTab = 'agents' | 'workspace' | 'swarm' | 'code' | 'settings';

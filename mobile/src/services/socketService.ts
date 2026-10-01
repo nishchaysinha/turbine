@@ -4,6 +4,24 @@ import { normalizePairingCode, normalizeSignalingUrl } from '../utils/pairing';
 import type { DirectoryCache, FileEntry } from '../utils/fileTree';
 import type { HistoryRun } from '../utils/history';
 import { bracketedPaste } from '../utils/review';
+import {
+  CAPABILITIES,
+  CLIENT_CAPABILITIES,
+  PROTOCOL_VERSION,
+  normalizeAgentState,
+  type AgentAction,
+  type AgentStatusRow,
+  type RpcResponse,
+} from './protocol';
+
+export class RpcFailure extends Error {
+  constructor(public code: string, message: string) {
+    super(message);
+  }
+}
+
+const RPC_TIMEOUT_MS = 10000;
+const HELLO_TIMEOUT_MS = 4000;
 
 export interface FilePreview {
   path: string;
@@ -60,9 +78,16 @@ export class SocketService {
   public projectRoot: string = '';
   public filePreview: FilePreview | null = null;
   public history: HistoryRun[] = [];
+  /** Host agent status rows by pane (mirrored from the desktop's status hub). */
+  public agentStatus: Record<string, AgentStatusRow> = {};
+  /** Capabilities the desktop answered `hello` with; empty = legacy host. */
+  public hostCapabilities: Set<string> = new Set();
+  public hostProtocol: number | null = null;
   public historyLoading = false;
   public historyError: string | null = null;
   public focusedPaneId: string | null = null;
+  /** Set by other screens (Agents → "Terminal") for the Terminals tab to open. */
+  public pendingFocusPaneId: string | null = null;
   public paneOutputs: Map<string, string> = new Map();
   public paneDimensions: Map<string, { cols: number; rows: number }> = new Map();
   public currentServerUrl: string = DEFAULT_SIGNALING_URL;
@@ -84,6 +109,9 @@ export class SocketService {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
   private wantConnected = false;
+  private rpcSeq = 0;
+  private rpcPending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
+  private subscribedPanes: string[] = [];
   private pendingConnect: { resolve: () => void; reject: (e: Error) => void; promise: Promise<void> } | null = null;
   private busyRetriesLeft = 0;
 
@@ -150,6 +178,7 @@ export class SocketService {
         this.pendingConnect = null;
         // Make sure we have the latest desktop state even if the initial sync raced us.
         if (this.focusedPaneId) this.requestTerminalSync(this.focusedPaneId);
+        void this.handshake();
       }
     } else if (status === 'disconnected' || status === 'error') {
       if (prev === 'connected' && this.wantConnected) {
@@ -359,6 +388,9 @@ export class SocketService {
 
   private teardownTransport() {
     this.stopPing();
+    this.failAllRpc('Disconnected');
+    this.hostCapabilities = new Set();
+    this.hostProtocol = null;
     getWebRTCBridge()?.disconnect();
     if (this.dc) {
       try { this.dc.close(); } catch {}
@@ -416,6 +448,91 @@ export class SocketService {
     }
   }
 
+  // --- Protocol v2 (request/response) ---
+
+  public supports(capability: string): boolean {
+    return this.hostCapabilities.has(capability);
+  }
+
+  /** Sends a request and resolves with the host's result, or rejects with its error. */
+  public request<T = unknown>(method: string, params: Record<string, unknown> = {}, timeoutMs = RPC_TIMEOUT_MS): Promise<T> {
+    const id = `m${Date.now().toString(36)}-${++this.rpcSeq}`;
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.rpcPending.delete(id);
+        reject(new RpcFailure('timeout', `Desktop did not answer ${method}`));
+      }, timeoutMs);
+      this.rpcPending.set(id, { resolve: resolve as (v: unknown) => void, reject, timer });
+      this.send('rpc', { id, method, params });
+    });
+  }
+
+  private failAllRpc(message: string) {
+    for (const [id, p] of this.rpcPending) {
+      clearTimeout(p.timer);
+      p.reject(new RpcFailure('disconnected', message));
+      this.rpcPending.delete(id);
+    }
+  }
+
+  /** Negotiates protocol v2; a host that predates it stays on legacy messages. */
+  private async handshake() {
+    try {
+      const res = await this.request<{ protocol?: number; capabilities?: unknown[] }>(
+        'hello',
+        { protocol: PROTOCOL_VERSION, capabilities: CLIENT_CAPABILITIES, client: { app: 'turbine-companion' } },
+        HELLO_TIMEOUT_MS
+      );
+      this.hostProtocol = typeof res?.protocol === 'number' ? res.protocol : null;
+      this.hostCapabilities = new Set((res?.capabilities ?? []).filter((c): c is string => typeof c === 'string'));
+      this.log(`Protocol v${this.hostProtocol ?? '?'} · ${[...this.hostCapabilities].join(', ') || 'no capabilities'}`);
+      if (this.subscribedPanes.length && this.supports(CAPABILITIES.terminalSubscribe)) {
+        void this.request('terminal.subscribe', { paneIds: this.subscribedPanes }).catch(() => {});
+      }
+    } catch {
+      this.hostCapabilities = new Set();
+      this.hostProtocol = 1;
+      this.log('Desktop speaks the legacy protocol (no RPC)');
+    }
+    this.notify();
+  }
+
+  /**
+   * Tells the desktop which panes are on screen so it only streams those
+   * (Orca-style subscriptions). Legacy hosts stream everything regardless.
+   */
+  public subscribeTerminals(paneIds: string[]) {
+    const next = [...new Set(paneIds)].sort();
+    if (next.join('|') === this.subscribedPanes.join('|')) return;
+    this.subscribedPanes = next;
+    if (this.supports(CAPABILITIES.terminalSubscribe)) {
+      void this.request('terminal.subscribe', { paneIds: next }).catch((e) => this.log(`Subscribe failed: ${e.message}`));
+    }
+  }
+
+  /** Approve / deny / interrupt / reply to an agent; falls back to raw keystrokes on legacy hosts. */
+  public async agentAction(paneId: string, action: AgentAction, text?: string): Promise<void> {
+    if (this.supports(CAPABILITIES.rpc)) {
+      await this.request('agents.action', { paneId, action, text });
+      return;
+    }
+    const keys: Record<string, string> = { approve: '\r', deny: '\x1b', interrupt: '\x1b' };
+    if (action === 'prompt') this.sendPromptToPane(paneId, text ?? '');
+    else this.sendTerminalInput(paneId, keys[action] ?? '');
+  }
+
+  /** Runs an RPC when the host supports it, surfacing failures in the error banner. */
+  private async tryRpc<T>(method: string, params: Record<string, unknown>, apply: (r: T) => void): Promise<boolean> {
+    if (!this.supports(CAPABILITIES.rpc)) return false;
+    try {
+      apply(await this.request<T>(method, params));
+    } catch (e) {
+      this.lastCommandError = e instanceof Error ? e.message : String(e);
+      this.notify();
+    }
+    return true;
+  }
+
   // --- Commands ---
 
   public sendTerminalInput(paneId: string, data: string) {
@@ -433,7 +550,9 @@ export class SocketService {
   }
 
   public triggerSwarm(prompt: string, presetId?: string) {
-    this.send('swarm:start', { prompt, presetId });
+    void this.tryRpc('swarm.start', { prompt, presetId }, () => {}).then((handled) => {
+      if (!handled) this.send('swarm:start', { prompt, presetId });
+    });
   }
 
   /** Type a follow-up message into a running agent's terminal. */
@@ -453,8 +572,12 @@ export class SocketService {
   public requestDirectory(path: string, refresh = false) {
     const existing = this.directories[path];
     this.directories = { ...this.directories, [path]: { entries: existing?.entries ?? [], loading: true } };
-    this.send('files:list', { path, refresh });
     this.notify();
+    void this.tryRpc<Record<string, unknown>>('files.list', { path, refresh }, (r) =>
+      this.handleMessage(JSON.stringify({ type: 'files:listing', payload: r }))
+    ).then((handled) => {
+      if (!handled) this.send('files:list', { path, refresh });
+    });
   }
 
   public refreshFiles() {
@@ -467,8 +590,12 @@ export class SocketService {
 
   public readFile(path: string) {
     this.filePreview = { path, content: '', loading: true };
-    this.send('files:read', { path });
     this.notify();
+    void this.tryRpc<Record<string, unknown>>('files.read', { path }, (r) =>
+      this.handleMessage(JSON.stringify({ type: 'files:content', payload: r }))
+    ).then((handled) => {
+      if (!handled) this.send('files:read', { path });
+    });
   }
 
   public closeFilePreview() {
@@ -479,8 +606,12 @@ export class SocketService {
   public requestHistory() {
     this.historyLoading = true;
     this.historyError = null;
-    this.send('history:request', {});
     this.notify();
+    void this.tryRpc<Record<string, unknown>>('history.list', {}, (r) =>
+      this.handleMessage(JSON.stringify({ type: 'history:data', payload: r }))
+    ).then((handled) => {
+      if (!handled) this.send('history:request', {});
+    });
   }
 
   public killAgent(agentId: string) {
@@ -494,11 +625,22 @@ export class SocketService {
   }
 
   public createTask(title: string, projectPath?: string) {
-    this.send('task:create', { title, projectPath: projectPath || '.' });
+    void this.tryRpc<{ tasks?: Task[] }>('task.create', { title, projectPath: projectPath || '.' }, (r) => {
+      if (Array.isArray(r?.tasks)) {
+        this.tasks = r.tasks;
+        this.notify();
+      }
+    }).then((handled) => {
+      if (!handled) this.send('task:create', { title, projectPath: projectPath || '.' });
+    });
   }
 
   public requestDiff(projectPath: string = '.') {
-    this.send('diff:request', { projectPath });
+    void this.tryRpc<Record<string, unknown>>('diff.get', { projectPath }, (r) => this.handleMessage(JSON.stringify({ type: 'diff:data', payload: r }))).then(
+      (handled) => {
+        if (!handled) this.send('diff:request', { projectPath });
+      }
+    );
   }
 
   public setFocusedPane(paneId: string | null) {
@@ -539,6 +681,36 @@ export class SocketService {
     const payload = msg?.payload || {};
 
     switch (msg?.type) {
+      case 'rpc:result': {
+        const res = payload as RpcResponse;
+        const pending = typeof res?.id === 'string' ? this.rpcPending.get(res.id) : undefined;
+        if (!pending) break;
+        clearTimeout(pending.timer);
+        this.rpcPending.delete(res.id);
+        if (res.ok) pending.resolve(res.result);
+        else pending.reject(new RpcFailure(res.error?.code ?? 'failed', res.error?.message ?? 'Request failed'));
+        break;
+      }
+
+      case 'agents:status': {
+        const row = payload.row as AgentStatusRow | undefined;
+        if (row && typeof row.paneId === 'string') {
+          this.agentStatus = { ...this.agentStatus, [row.paneId]: { ...row, state: normalizeAgentState(row.state) } };
+          this.notify();
+        }
+        break;
+      }
+
+      case 'agents:clear': {
+        if (typeof payload.paneId === 'string' && this.agentStatus[payload.paneId]) {
+          const next = { ...this.agentStatus };
+          delete next[payload.paneId];
+          this.agentStatus = next;
+          this.notify();
+        }
+        break;
+      }
+
       case 'ping': {
         // Desktop measures latency too; echo its timestamp back.
         this.send('pong', { clientTime: payload.clientTime });
@@ -560,6 +732,13 @@ export class SocketService {
         if (Array.isArray(payload.swarmRuns)) this.swarmRuns = payload.swarmRuns;
         if (Array.isArray(payload.swarmAgents)) this.swarmAgents = payload.swarmAgents;
         if (Array.isArray(payload.presets)) this.presets = payload.presets;
+        if (Array.isArray(payload.agentStatus)) {
+          this.agentStatus = Object.fromEntries(
+            (payload.agentStatus as AgentStatusRow[])
+              .filter((r) => r && typeof r.paneId === 'string')
+              .map((r) => [r.paneId, { ...r, state: normalizeAgentState(r.state) }])
+          );
+        }
         if (payload.activePaneId && !this.focusedPaneId) this.focusedPaneId = payload.activePaneId;
         this.notify();
         break;
